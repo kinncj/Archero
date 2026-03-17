@@ -1833,7 +1833,8 @@ Screen {
     layout: grid;
     grid-size: 2;
     grid-gutter: 1;
-    height: 1fr;
+    min-height: 20;
+    height: auto;
 }
 
 .diff-panel {
@@ -1841,6 +1842,7 @@ Screen {
     background: $surface;
     overflow-y: auto;
     padding: 0 1;
+    min-height: 18;
 }
 
 .diff-added   { color: $success; }
@@ -1982,11 +1984,11 @@ def launch_tui():
 
     class ApplyPanel(Container):
         STEPS = ["locale", "packages", "dotfiles", "config", "services", "bootloader", "swap"]
-        _snaps: list = []
+        _filtered: list = []
 
         def compose(self) -> ComposeResult:
             yield Label("snapshot file")
-            yield Input(placeholder="type or select below...", id="apply-path")
+            yield Input(placeholder="type to search snapshots...", id="apply-path")
             yield ListView(id="apply-snap-list", classes="snap-list")
             yield Label("steps")
             with Container(classes="section-grid"):
@@ -1998,34 +2000,29 @@ def launch_tui():
             yield Log(id="apply-log", auto_scroll=True)
 
         def on_mount(self):
-            self._refresh_list("")
+            self._rebuild_list("")
 
-        def _refresh_list(self, q: str):
-            self._snaps = _list_snapshots()
+        def _rebuild_list(self, q: str):
+            snaps = _list_snapshots()
             lv = self.query_one("#apply-snap-list", ListView)
             lv.clear()
-            for path in self._snaps:
+            self._filtered = []
+            for path in snaps:
                 if not q or q.lower() in path.lower():
                     lv.append(ListItem(Label(Path(path).name)))
-            if not self._snaps:
-                lv.append(ListItem(Label("[dim]no snapshots in ~/.config/archero/snapshots/[/]")))
+                    self._filtered.append(path)
+            if not self._filtered:
+                lv.append(ListItem(Label("[dim]no snapshots found[/]")))
 
         def on_input_changed(self, event: Input.Changed):
             if event.input.id == "apply-path":
-                self._refresh_list(event.value)
+                self._rebuild_list(event.value)
 
         def on_list_view_selected(self, event: ListView.Selected):
             if event.list_view.id == "apply-snap-list":
-                try:
-                    name = str(event.item.query_one(Label).renderable)
-                    if name.startswith("[dim]"):
-                        return
-                    for path in self._snaps:
-                        if Path(path).name == name:
-                            self.query_one("#apply-path", Input).value = path
-                            break
-                except Exception:
-                    pass
+                idx = event.list_view.index
+                if idx is not None and idx < len(self._filtered):
+                    self.query_one("#apply-path", Input).value = self._filtered[idx]
 
         def on_button_pressed(self, event: Button.Pressed):
             if event.button.id in ("btn-dry", "btn-apply"):
@@ -2070,6 +2067,8 @@ def launch_tui():
 
     class DiffPanel(Container):
         _snaps: list = []
+        _filtered_a: list = []  # filtered paths shown in list A
+        _filtered_b: list = []  # filtered paths shown in list B
 
         def compose(self) -> ComposeResult:
             yield Label("file A  (older / saved snapshot)")
@@ -2085,43 +2084,41 @@ def launch_tui():
 
         def on_mount(self):
             self._snaps = _list_snapshots()
-            self._refresh_list("diff-list-a", "")
-            self._refresh_list("diff-list-b", "")
+            self._rebuild_list("a", "")
+            self._rebuild_list("b", "")
 
-        def _refresh_list(self, list_id: str, q: str):
+        def _rebuild_list(self, which: str, q: str):
             self._snaps = _list_snapshots()
-            lv = self.query_one(f"#{list_id}", ListView)
+            lv = self.query_one(f"#diff-list-{which}", ListView)
             lv.clear()
-            if list_id == "diff-list-b":
-                lv.append(ListItem(Label("(live system)"), id="opt-live"))
+            filtered = []
+            if which == "b":
+                lv.append(ListItem(Label("(live system)")))
+                filtered.append("")  # blank = live system
             for path in self._snaps:
                 if not q or q.lower() in path.lower():
                     lv.append(ListItem(Label(Path(path).name)))
+                    filtered.append(path)
+            if which == "a":
+                self._filtered_a = filtered
+            else:
+                self._filtered_b = filtered
 
         def on_input_changed(self, event: Input.Changed):
             if event.input.id == "diff-a":
-                self._refresh_list("diff-list-a", event.value)
+                self._rebuild_list("a", event.value)
             elif event.input.id == "diff-b":
-                self._refresh_list("diff-list-b", event.value)
+                self._rebuild_list("b", event.value)
 
         def on_list_view_selected(self, event: ListView.Selected):
-            # Map each list to its input
-            target_map = {"diff-list-a": "diff-a", "diff-list-b": "diff-b"}
-            input_id = target_map.get(event.list_view.id)
-            if not input_id:
-                return
-            try:
-                label_text = str(event.item.query_one(Label).renderable)
-                target = self.query_one(f"#{input_id}", Input)
-                if label_text.startswith("(live"):
-                    target.value = ""
-                    return
-                for path in self._snaps:
-                    if Path(path).name == label_text:
-                        target.value = path
-                        break
-            except Exception:
-                pass
+            lv_id = event.list_view.id
+            idx = event.list_view.index
+            if lv_id == "diff-list-a" and idx is not None:
+                if idx < len(self._filtered_a):
+                    self.query_one("#diff-a", Input).value = self._filtered_a[idx]
+            elif lv_id == "diff-list-b" and idx is not None:
+                if idx < len(self._filtered_b):
+                    self.query_one("#diff-b", Input).value = self._filtered_b[idx]
 
         def on_button_pressed(self, event: Button.Pressed):
             if event.button.id == "btn-diff":
@@ -2463,7 +2460,6 @@ def launch_tui():
 
         def on_key(self, event) -> None:
             key = event.key
-
             # ctrl+q always quits
             if key == "ctrl+q":
                 self.action_quit()
