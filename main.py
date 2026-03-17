@@ -1357,6 +1357,17 @@ def diff_snapshots(old: dict, new: dict):
     print(f"  New: {new.get('meta', {}).get('generated_at', 'unknown')}")
     print(f"{'═' * 60}")
 
+    # Meta
+    print("\n── Meta ──")
+    old_host = old.get("meta", {}).get("hostname", "")
+    new_host = new.get("meta", {}).get("hostname", "")
+    if old_host != new_host:
+        print(f"  hostname: {old_host} → {new_host}")
+    old_distro = old.get("meta", {}).get("distro", "")
+    new_distro = new.get("meta", {}).get("distro", "")
+    if old_distro != new_distro:
+        print(f"  distro: {old_distro} → {new_distro}")
+
     # Packages
     print("\n── Packages ──")
     compare_lists(
@@ -2193,6 +2204,17 @@ def launch_tui():
                     right.write_line(f"\n── {label} ──")
                     left.write_line(f"  {a}")
                     right.write_line(f"  {b}")
+
+            # Meta
+            cmp_scalar("hostname", old.get("meta", {}).get("hostname", ""), new.get("meta", {}).get("hostname", ""))
+            cmp_scalar("distro", old.get("meta", {}).get("distro", ""), new.get("meta", {}).get("distro", ""))
+
+            # Hardware
+            cmp_scalar("cpu", old.get("hardware", {}).get("cpu_model", ""), new.get("hardware", {}).get("cpu_model", ""))
+            cmp_scalar("ram", old.get("hardware", {}).get("ram_total", ""), new.get("hardware", {}).get("ram_total", ""))
+
+            # Boot
+            cmp_scalar("bootloader", old.get("boot", {}).get("bootloader", ""), new.get("boot", {}).get("bootloader", ""))
 
             # Packages
             cmp_lists("native packages", old.get("packages", {}).get("native_explicit", []), new.get("packages", {}).get("native_explicit", []))
