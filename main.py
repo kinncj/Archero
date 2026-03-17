@@ -2150,10 +2150,15 @@ def launch_tui():
             left.write_line(f"file: {path_a}")
             left.write_line(f"date: {old.get('meta', {}).get('generated_at', 'unknown')}")
             right.write_line(f"date: {new.get('meta', {}).get('generated_at', 'unknown')}")
-            def cmp(label, a, b):
+
+            found_diff = False
+
+            def cmp_lists(label, a, b):
+                nonlocal found_diff
                 added = sorted(set(b) - set(a))
                 removed = sorted(set(a) - set(b))
                 if added or removed:
+                    found_diff = True
                     left.write_line(f"\n── {label} ──")
                     right.write_line(f"\n── {label} ──")
                     for p in removed:
@@ -2162,16 +2167,65 @@ def launch_tui():
                     for p in added:
                         left.write_line("")
                         right.write_line(f"  + {p}")
-            cmp("native packages", old.get("packages", {}).get("native_explicit", []), new.get("packages", {}).get("native_explicit", []))
-            cmp("AUR packages", old.get("packages", {}).get("aur_packages", []), new.get("packages", {}).get("aur_packages", []))
-            cmp("enabled services", old.get("services", {}).get("enabled_system_units", []), new.get("services", {}).get("enabled_system_units", []))
-            cmp("ollama models", old.get("development", {}).get("ollama_models", []), new.get("development", {}).get("ollama_models", []))
-            old_k = old.get("kernel", {}).get("version", "")
-            new_k = new.get("kernel", {}).get("version", "")
-            if old_k != new_k:
-                left.write_line(f"\n── kernel ──\n  {old_k}")
-                right.write_line(f"\n── kernel ──\n  {new_k}")
-            self.app.call_from_thread(self.app.notify, "Diff complete", title="diff done", severity="information")
+
+            def cmp_dicts(label, old_d, new_d):
+                nonlocal found_diff
+                all_keys = set(old_d) | set(new_d)
+                changes = []
+                for k in sorted(all_keys):
+                    ov = old_d.get(k, "<missing>")
+                    nv = new_d.get(k, "<missing>")
+                    if ov != nv:
+                        changes.append((k, ov, nv))
+                if changes:
+                    found_diff = True
+                    left.write_line(f"\n── {label} ──")
+                    right.write_line(f"\n── {label} ──")
+                    for k, ov, nv in changes:
+                        left.write_line(f"  {k}: {str(ov)[:80]}")
+                        right.write_line(f"  {k}: {str(nv)[:80]}")
+
+            def cmp_scalar(label, a, b):
+                nonlocal found_diff
+                if a != b:
+                    found_diff = True
+                    left.write_line(f"\n── {label} ──")
+                    right.write_line(f"\n── {label} ──")
+                    left.write_line(f"  {a}")
+                    right.write_line(f"  {b}")
+
+            # Packages
+            cmp_lists("native packages", old.get("packages", {}).get("native_explicit", []), new.get("packages", {}).get("native_explicit", []))
+            cmp_lists("AUR packages", old.get("packages", {}).get("aur_packages", []), new.get("packages", {}).get("aur_packages", []))
+            cmp_lists("flatpak", old.get("packages", {}).get("flatpak", []), new.get("packages", {}).get("flatpak", []))
+
+            # Kernel
+            cmp_scalar("kernel", old.get("kernel", {}).get("version", ""), new.get("kernel", {}).get("version", ""))
+            cmp_lists("loaded modules", old.get("kernel", {}).get("loaded_modules", []), new.get("kernel", {}).get("loaded_modules", []))
+
+            # Services
+            cmp_lists("enabled services", old.get("services", {}).get("enabled_system_units", []), new.get("services", {}).get("enabled_system_units", []))
+            cmp_lists("custom units", list(old.get("services", {}).get("custom_system_units", {}).keys()), list(new.get("services", {}).get("custom_system_units", {}).keys()))
+
+            # Config
+            cmp_dicts("modprobe.d", old.get("config", {}).get("modprobe_d", {}), new.get("config", {}).get("modprobe_d", {}))
+            cmp_dicts("udev rules", old.get("config", {}).get("udev_rules", {}), new.get("config", {}).get("udev_rules", {}))
+
+            # Power
+            cmp_scalar("power profile", old.get("power", {}).get("power_profile", ""), new.get("power", {}).get("power_profile", ""))
+
+            # Development
+            cmp_dicts("tool versions", old.get("development", {}).get("tools", {}), new.get("development", {}).get("tools", {}))
+            cmp_lists("ollama models", old.get("development", {}).get("ollama_models", []), new.get("development", {}).get("ollama_models", []))
+
+            # Dotfiles
+            cmp_lists(".config directories", old.get("dotfiles", {}).get("config_directories", []), new.get("dotfiles", {}).get("config_directories", []))
+
+            if not found_diff:
+                left.write_line("\n✓ no differences found")
+                right.write_line("\n✓ no differences found")
+
+            self.app.call_from_thread(self.app.notify, "Diff complete" if found_diff else "No differences found", title="diff done", severity="information")
 
     # ── Stats Panel ───────────────────────────────────────────────────────────
 
