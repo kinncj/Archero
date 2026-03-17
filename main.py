@@ -1984,7 +1984,7 @@ def launch_tui():
             yield Label("steps")
             with Container(classes="section-grid"):
                 for step in self.STEPS:
-                    yield Checkbox(step, value=True, id=f"step-{{step}}")
+                    yield Checkbox(step, value=True, id=f"step-{step}")
             with Horizontal():
                 yield Button("dry run ↵", id="btn-dry", variant="default")
                 yield Button("apply (confirm) ↵", id="btn-apply", variant="warning")
@@ -2028,7 +2028,7 @@ def launch_tui():
         def run_apply(self, confirm: bool):
             log = self.query_one("#apply-log", Log)
             snap_path = self.query_one("#apply-path", Input).value.strip()
-            selected_steps = [s for s in self.STEPS if self.query_one(f"#step-{{s}}", Checkbox).value]
+            selected_steps = [s for s in self.STEPS if self.query_one(f"#step-{s}", Checkbox).value]
             log.clear()
             if not snap_path or not Path(snap_path).exists():
                 log.write_line("✗ snapshot file not found")
@@ -2038,9 +2038,9 @@ def launch_tui():
                 snapshot = json.load(f)
             mode = "APPLYING" if confirm else "DRY RUN"
             log.write_line("═" * 50)
-            log.write_line(f"  {{mode}} — steps: {{', '.join(selected_steps)}}")
+            log.write_line(f"  {mode} — steps: {', '.join(selected_steps)}")
             log.write_line("═" * 50)
-            self.app.call_from_thread(self.app.notify, f"{{mode}} — {{', '.join(selected_steps)}}", title="apply", severity="warning" if confirm else "information")
+            self.app.call_from_thread(self.app.notify, f"{mode} — {', '.join(selected_steps)}", title="apply", severity="warning" if confirm else "information")
             import io
             from contextlib import redirect_stdout
             class LogWriter(io.StringIO):
@@ -2057,7 +2057,7 @@ def launch_tui():
             ok  = sum(1 for s, _ in applier.actions if s == "OK")
             dry = sum(1 for s, _ in applier.actions if s == "DRY")
             err = sum(1 for s, _ in applier.actions if s == "ERROR")
-            self.app.call_from_thread(self.app.notify, f"{{ok}} applied · {{dry}} dry-run · {{err}} errors", title="apply done", severity="error" if err else "information")
+            self.app.call_from_thread(self.app.notify, f"{ok} applied · {dry} dry-run · {err} errors", title="apply done", severity="error" if err else "information")
 
     # ── Diff Panel ────────────────────────────────────────────────────────────────────────────────
 
@@ -2127,35 +2127,35 @@ def launch_tui():
             if path_b and Path(path_b).exists():
                 with open(path_b) as f:
                     new = json.load(f)
-                right.write_line(f"file: {{path_b}}")
+                right.write_line(f"file: {path_b}")
             else:
                 right.write_line("capturing live system...")
-                new = {{name: fn() for name, fn in ALL_COLLECTORS.items()}}
+                new = {name: fn() for name, fn in ALL_COLLECTORS.items()}
                 right.write_line("live system captured")
-            left.write_line(f"file: {{path_a}}")
-            left.write_line(f"date: {{old.get('meta', {{}}).get('generated_at', 'unknown')}}")
-            right.write_line(f"date: {{new.get('meta', {{}}).get('generated_at', 'unknown')}}")
+            left.write_line(f"file: {path_a}")
+            left.write_line(f"date: {old.get('meta', {}).get('generated_at', 'unknown')}")
+            right.write_line(f"date: {new.get('meta', {}).get('generated_at', 'unknown')}")
             def cmp(label, a, b):
                 added = sorted(set(b) - set(a))
                 removed = sorted(set(a) - set(b))
                 if added or removed:
-                    left.write_line(f"\n── {{label}} ──")
-                    right.write_line(f"\n── {{label}} ──")
+                    left.write_line(f"\n── {label} ──")
+                    right.write_line(f"\n── {label} ──")
                     for p in removed:
-                        left.write_line(f"  - {{p}}")
+                        left.write_line(f"  - {p}")
                         right.write_line("")
                     for p in added:
                         left.write_line("")
-                        right.write_line(f"  + {{p}}")
-            cmp("native packages", old.get("packages", {{}}).get("native_explicit", []), new.get("packages", {{}}).get("native_explicit", []))
-            cmp("AUR packages", old.get("packages", {{}}).get("aur_packages", []), new.get("packages", {{}}).get("aur_packages", []))
-            cmp("enabled services", old.get("services", {{}}).get("enabled_system_units", []), new.get("services", {{}}).get("enabled_system_units", []))
-            cmp("ollama models", old.get("development", {{}}).get("ollama_models", []), new.get("development", {{}}).get("ollama_models", []))
-            old_k = old.get("kernel", {{}}).get("version", "")
-            new_k = new.get("kernel", {{}}).get("version", "")
+                        right.write_line(f"  + {p}")
+            cmp("native packages", old.get("packages", {}).get("native_explicit", []), new.get("packages", {}).get("native_explicit", []))
+            cmp("AUR packages", old.get("packages", {}).get("aur_packages", []), new.get("packages", {}).get("aur_packages", []))
+            cmp("enabled services", old.get("services", {}).get("enabled_system_units", []), new.get("services", {}).get("enabled_system_units", []))
+            cmp("ollama models", old.get("development", {}).get("ollama_models", []), new.get("development", {}).get("ollama_models", []))
+            old_k = old.get("kernel", {}).get("version", "")
+            new_k = new.get("kernel", {}).get("version", "")
             if old_k != new_k:
-                left.write_line(f"\n── kernel ──\n  {{old_k}}")
-                right.write_line(f"\n── kernel ──\n  {{new_k}}")
+                left.write_line(f"\n── kernel ──\n  {old_k}")
+                right.write_line(f"\n── kernel ──\n  {new_k}")
             self.app.call_from_thread(self.app.notify, "Diff complete", title="diff done", severity="information")
 
     # ── Stats Panel ───────────────────────────────────────────────────────────
