@@ -2497,9 +2497,13 @@ def launch_tui():
                     self._enter_panel()
 
             # Panel mode — arrow keys cycle through focusable widgets
+            # But let ListView/Input handle their own keys
             else:
                 if key != "escape":
                     self._esc_count = 0
+                focused = self.focused
+                if isinstance(focused, (ListView, Input)):
+                    return  # let the widget handle arrow keys, typing, enter, etc.
                 if key in ("down", "right"):
                     event.stop()
                     self.action_focus_next()
@@ -2567,7 +2571,7 @@ def _show_loading(delay: float = 2.0):
         row("  \u255a\u2550\u255d  \u255a\u2550\u255d\u255a\u2550\u255d  \u255a\u2550\u255d \u255a\u2550\u2550\u2550\u2550\u2550\u255d\u255a\u2550\u255d  \u255a\u2550\u255d\u255a\u2550\u2550\u2550\u2550\u2550\u2550\u255d\u255a\u2550\u255d  \u255a\u2550\u255d \u255a\u2550\u2550\u2550\u2550\u2550\u255d ", C3),
         row(),
         row("  CachyOS & Arch Linux  --  snapshot · apply · diff · tui  ", YL),
-        row("  github.com/kinncj/archero · GPLv3                          ", DM),
+        row("  github.com/kinncj/archero · GPLv3                        ", DM),
         row(),
         f"{C1}{B}  \u255a{'\u2550' * W}\u255d{R}",
     ]
