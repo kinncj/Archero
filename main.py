@@ -2063,13 +2063,14 @@ def launch_tui():
 
     class DiffPanel(Container):
         _snaps: list = []
+        _active_input: str = "diff-a"  # tracks which input the list is serving
 
         def compose(self) -> ComposeResult:
             yield Label("file A  (older / saved snapshot)")
-            yield Input(placeholder="type or select below...", id="diff-a")
-            yield ListView(id="diff-snap-list")
+            yield Input(placeholder="type to search snapshots...", id="diff-a")
             yield Label("file B  (newer — leave blank to compare vs live system)")
-            yield Input(placeholder="leave empty = compare against live system", id="diff-b")
+            yield Input(placeholder="type to search or leave empty for live system", id="diff-b")
+            yield ListView(id="diff-snap-list")
             yield Button("compare ↵", id="btn-diff", variant="success")
             with Horizontal(id="diff-container"):
                 yield Log(id="diff-left",  auto_scroll=False, classes="diff-panel")
@@ -2082,25 +2083,28 @@ def launch_tui():
             self._snaps = _list_snapshots()
             lv = self.query_one("#diff-snap-list", ListView)
             lv.clear()
+            # Blank option — for file B this means "compare vs live system"
+            lv.append(ListItem(Label("[dim](none — use live system)[/dim]")))
             for path in self._snaps:
                 if not q or q.lower() in path.lower():
                     lv.append(ListItem(Label(Path(path).name)))
-            if not self._snaps:
-                lv.append(ListItem(Label("[dim]no snapshots found[/]")))
 
         def on_input_changed(self, event: Input.Changed):
-            if event.input.id == "diff-a":
+            if event.input.id in ("diff-a", "diff-b"):
+                self._active_input = event.input.id
                 self._refresh_list(event.value)
 
         def on_list_view_selected(self, event: ListView.Selected):
             if event.list_view.id == "diff-snap-list":
                 try:
                     name = str(event.item.query_one(Label).renderable)
+                    target = self.query_one(f"#{self._active_input}", Input)
                     if name.startswith("[dim]"):
+                        target.value = ""
                         return
                     for path in self._snaps:
                         if Path(path).name == name:
-                            self.query_one("#diff-a", Input).value = path
+                            target.value = path
                             break
                 except Exception:
                     pass
@@ -2496,15 +2500,50 @@ def launch_tui():
                     event.stop()
                     self._enter_panel()
 
-            # Panel mode — arrow keys cycle through focusable widgets
-            # But let ListView/Input handle their own keys
+            # Panel mode
             else:
                 if key != "escape":
                     self._esc_count = 0
                 focused = self.focused
-                if isinstance(focused, (ListView, Input)):
-                    return  # let the widget handle arrow keys, typing, enter, etc.
-                if key in ("down", "right"):
+
+                # ListView: let it handle up/down/enter natively
+                if isinstance(focused, ListView):
+                    if key in ("up", "down", "enter"):
+                        return  # widget handles it
+                    # Tab / right to move to next widget
+                    if key in ("tab", "right"):
+                        event.stop()
+                        self.action_focus_next()
+                        return
+                    return
+
+                # Input: down-arrow jumps to the associated ListView below
+                if isinstance(focused, Input):
+                    # Track which input is active for DiffPanel
+                    if focused.id in ("diff-a", "diff-b"):
+                        try:
+                            dp = self.query_one("#panel-diff")
+                            dp._active_input = focused.id
+                        except Exception:
+                            pass
+                    if key == "down":
+                        event.stop()
+                        # Find the next ListView sibling in the same panel
+                        try:
+                            panel = self.query_one(f"#panel-{self._active_panel}")
+                            lv = panel.query("ListView")
+                            if lv:
+                                self.set_focus(lv.first())
+                        except Exception:
+                            self.action_focus_next()
+                        return
+                    if key == "tab":
+                        event.stop()
+                        self.action_focus_next()
+                        return
+                    return  # let Input handle all other keys (typing, left/right, etc.)
+
+                if key in ("down", "right", "tab"):
                     event.stop()
                     self.action_focus_next()
                 elif key in ("up", "left"):
