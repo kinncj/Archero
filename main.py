@@ -1279,6 +1279,264 @@ class Applier:
         if resume_uuid and resume_offset:
             self.log("WARN", f"Original resume_offset={resume_offset} — recalculate on new system")
 
+    # ── Plan (terraform-style) ──────────────────────────────────────────────
+
+    def plan(self, steps: list = None):
+        """Show what would change, comparing snapshot desired state vs live system."""
+        available_steps = {
+            "locale":     self._plan_locale,
+            "packages":   self._plan_packages,
+            "dotfiles":   self._plan_dotfiles,
+            "config":     self._plan_config,
+            "services":   self._plan_services,
+            "bootloader": self._plan_bootloader,
+            "swap":       self._plan_swap,
+        }
+        selected = steps or list(available_steps.keys())
+
+        print(f"\n{'═' * 60}")
+        print(f"  PLAN — comparing snapshot vs live system")
+        print(f"  Distro: {self.distro}")
+        print(f"  Steps: {', '.join(selected)}")
+        print(f"{'═' * 60}")
+        print(f"  + create/install   ~ modify   - remove   = unchanged")
+        print(f"{'─' * 60}")
+
+        changes = 0
+        for step_name in selected:
+            if step_name in available_steps:
+                changes += available_steps[step_name]()
+
+        print(f"\n{'═' * 60}")
+        if changes:
+            print(f"  Plan: {changes} change(s). Run with --confirm to apply.")
+        else:
+            print(f"  Plan: no changes needed. System matches snapshot.")
+        print(f"{'═' * 60}\n")
+        return changes
+
+    def _plan_locale(self) -> int:
+        changes = 0
+        cfg = self.snap.get("config", {})
+        print("\n── Locale & Timezone ──")
+
+        locale_conf = cfg.get("locale_conf", "")
+        if locale_conf:
+            current = read("/etc/locale.conf")
+            if current != locale_conf:
+                print(f"  ~ /etc/locale.conf")
+                changes += 1
+            else:
+                print(f"  = /etc/locale.conf (unchanged)")
+
+        tz = cfg.get("timezone", "")
+        if tz:
+            current_tz = read("/etc/timezone").strip() or run("timedatectl show -p Timezone --value")
+            if current_tz != tz:
+                print(f"  ~ timezone: {current_tz} → {tz}")
+                changes += 1
+            else:
+                print(f"  = timezone: {tz}")
+
+        hostname = cfg.get("hostname", "")
+        if hostname:
+            import socket
+            current_host = socket.gethostname()
+            if current_host != hostname:
+                print(f"  ~ hostname: {current_host} → {hostname}")
+                changes += 1
+            else:
+                print(f"  = hostname: {hostname}")
+        return changes
+
+    def _plan_packages(self) -> int:
+        changes = 0
+        pkgs = self.snap.get("packages", {})
+        print("\n── Packages ──")
+
+        # Native explicit
+        desired = set(pkgs.get("native_explicit", []))
+        installed = set(run_lines("pacman -Qqe 2>/dev/null"))
+        to_install = sorted(desired - installed)
+        to_remove = sorted(installed - desired)
+        if to_install:
+            print(f"  + install {len(to_install)} native packages:")
+            for p in to_install[:20]:
+                print(f"    + {p}")
+            if len(to_install) > 20:
+                print(f"    ... and {len(to_install) - 20} more")
+            changes += len(to_install)
+        if to_remove:
+            print(f"  - {len(to_remove)} packages not in snapshot (will NOT be removed automatically)")
+
+        # AUR
+        aur_desired = set(pkgs.get("aur_packages", []))
+        aur_installed = set(run_lines("pacman -Qqm 2>/dev/null"))
+        aur_to_install = sorted(aur_desired - aur_installed)
+        if aur_to_install:
+            print(f"  + install {len(aur_to_install)} AUR packages:")
+            for p in aur_to_install[:20]:
+                print(f"    + {p}")
+            if len(aur_to_install) > 20:
+                print(f"    ... and {len(aur_to_install) - 20} more")
+            changes += len(aur_to_install)
+
+        # Flatpak
+        flatpak_desired = set(pkgs.get("flatpak", []))
+        flatpak_installed = set(run_lines("flatpak list --app --columns=application 2>/dev/null"))
+        flatpak_to_install = sorted(flatpak_desired - flatpak_installed)
+        if flatpak_to_install:
+            print(f"  + install {len(flatpak_to_install)} flatpak apps:")
+            for p in flatpak_to_install:
+                print(f"    + {p}")
+            changes += len(flatpak_to_install)
+
+        if changes == 0:
+            print(f"  = all packages match")
+        return changes
+
+    def _plan_dotfiles(self) -> int:
+        changes = 0
+        dots = self.snap.get("dotfiles", {})
+        home = Path(dots.get("home_directory", str(get_user_home())))
+        print("\n── Dotfiles ──")
+
+        for rel, content in dots.get("key_dotfiles", {}).items():
+            if content == "[REDACTED]":
+                print(f"  - {rel} (redacted — manual restore)")
+                continue
+            full = home / rel
+            if not full.exists():
+                print(f"  + {rel} (new)")
+                changes += 1
+            elif full.read_text().strip() != content.strip():
+                print(f"  ~ {rel} (modified)")
+                changes += 1
+            else:
+                print(f"  = {rel}")
+
+        if changes == 0:
+            print(f"  = all dotfiles match")
+        return changes
+
+    def _plan_config(self) -> int:
+        changes = 0
+        cfg = self.snap.get("config", {})
+        print("\n── System Config ──")
+
+        for section, basedir in [
+            ("modprobe_d", "/etc/modprobe.d"),
+            ("udev_rules", "/etc/udev/rules.d"),
+            ("tmpfiles_d", "/etc/tmpfiles.d"),
+            ("sysctl_d",   "/etc/sysctl.d"),
+        ]:
+            for name, content in cfg.get(section, {}).items():
+                if section == "sysctl_d" and name == "99-active":
+                    continue
+                path = f"{basedir}/{name}"
+                current = read(path)
+                if not current:
+                    print(f"  + {path} (new)")
+                    changes += 1
+                elif current.strip() != content.strip():
+                    print(f"  ~ {path} (modified)")
+                    changes += 1
+                else:
+                    print(f"  = {path}")
+
+        env_desired = cfg.get("environment", "")
+        if env_desired:
+            current_env = read("/etc/environment")
+            if current_env.strip() != env_desired.strip():
+                print(f"  ~ /etc/environment")
+                changes += 1
+            else:
+                print(f"  = /etc/environment")
+
+        if changes == 0:
+            print(f"  = all config files match")
+        return changes
+
+    def _plan_services(self) -> int:
+        changes = 0
+        svcs = self.snap.get("services", {})
+        print("\n── Systemd Services ──")
+
+        # Custom unit files
+        for name, content in svcs.get("custom_system_units", {}).items():
+            path = f"/etc/systemd/system/{name}"
+            current = read(path)
+            if not current:
+                print(f"  + {path} (new)")
+                changes += 1
+            elif current.strip() != content.strip():
+                print(f"  ~ {path} (modified)")
+                changes += 1
+            else:
+                print(f"  = {path}")
+
+        if changes == 0:
+            print(f"  = all services match")
+        return changes
+
+    def _plan_bootloader(self) -> int:
+        changes = 0
+        boot = self.snap.get("boot", {})
+        bootloader = boot.get("bootloader", "unknown")
+        print(f"\n── Bootloader ({bootloader}) ──")
+
+        if bootloader == "grub":
+            grub_conf = boot.get("bootloader_config", {}).get("default_grub", "")
+            if grub_conf:
+                current = read("/etc/default/grub")
+                if current.strip() != grub_conf.strip():
+                    print(f"  ~ /etc/default/grub (modified → will regenerate grub.cfg)")
+                    changes += 1
+                else:
+                    print(f"  = /etc/default/grub")
+
+            mkinit = boot.get("mkinitcpio", {}).get("conf", "")
+            if mkinit:
+                current = read("/etc/mkinitcpio.conf")
+                if current.strip() != mkinit.strip():
+                    print(f"  ~ /etc/mkinitcpio.conf (modified → will rebuild initramfs)")
+                    changes += 1
+                else:
+                    print(f"  = /etc/mkinitcpio.conf")
+        elif bootloader == "limine":
+            limine_conf = boot.get("bootloader_config", {}).get("limine_conf", "")
+            if limine_conf:
+                for p in ["/boot/limine.conf", "/boot/limine/limine.conf"]:
+                    current = read(p)
+                    if current:
+                        if current.strip() != limine_conf.strip():
+                            print(f"  ~ {p}")
+                            changes += 1
+                        else:
+                            print(f"  = {p}")
+                        break
+        else:
+            print(f"  ? unknown bootloader: {bootloader}")
+
+        if changes == 0:
+            print(f"  = bootloader config matches")
+        return changes
+
+    def _plan_swap(self) -> int:
+        power = self.snap.get("power", {})
+        hibernate = power.get("hibernate", {})
+        swap_file = hibernate.get("swap_file", "")
+        print("\n── Swap & Hibernate ──")
+        if not swap_file:
+            print(f"  = no swapfile in snapshot")
+            return 0
+        if Path(swap_file).exists():
+            print(f"  = {swap_file} exists")
+        else:
+            print(f"  + {swap_file} (manual setup required)")
+        print(f"  ⚠ swap/hibernate always requires manual verification")
+        return 0
+
     def apply(self, steps: list = None):
         available_steps = {
             "locale":     self.step_locale,
@@ -1501,10 +1759,6 @@ def cmd_snapshot(args):
 
 
 def cmd_apply(args):
-    if os.geteuid() != 0:
-        print("✗ apply mode requires root.", file=sys.stderr)
-        sys.exit(1)
-
     snap_path = args.snapshot
     if not Path(snap_path).exists():
         print(f"✗ Snapshot file not found: {snap_path}", file=sys.stderr)
@@ -1518,7 +1772,14 @@ def cmd_apply(args):
         confirm=args.confirm,
         distro=args.distro,
     )
-    applier.apply(steps=args.steps)
+    if not args.confirm:
+        # Plan mode — no root needed, just compare
+        applier.plan(steps=args.steps)
+    else:
+        if os.geteuid() != 0:
+            print("✗ apply --confirm requires root.", file=sys.stderr)
+            sys.exit(1)
+        applier.apply(steps=args.steps)
 
 
 def cmd_diff(args):
@@ -2006,7 +2267,7 @@ def launch_tui():
                 for step in self.STEPS:
                     yield Checkbox(step, value=True, id=f"step-{step}")
             with Horizontal():
-                yield Button("dry run ↵", id="btn-dry", variant="default")
+                yield Button("plan ↵", id="btn-dry", variant="default")
                 yield Button("apply (confirm) ↵", id="btn-apply", variant="warning")
             yield Log(id="apply-log", auto_scroll=True)
 
@@ -2068,11 +2329,15 @@ def launch_tui():
                     return len(s)
             applier = Applier(snapshot=snapshot, confirm=confirm, distro="auto")
             with redirect_stdout(LogWriter(log)):
-                applier.apply(steps=selected_steps)
-            ok  = sum(1 for s, _ in applier.actions if s == "OK")
-            dry = sum(1 for s, _ in applier.actions if s == "DRY")
-            err = sum(1 for s, _ in applier.actions if s == "ERROR")
-            self.app.call_from_thread(self.app.notify, f"{ok} applied · {dry} dry-run · {err} errors", title="apply done", severity="error" if err else "information")
+                if not confirm:
+                    n = applier.plan(steps=selected_steps)
+                    self.app.call_from_thread(self.app.notify, f"Plan: {n} change(s)" if n else "No changes needed", title="plan done", severity="information")
+                else:
+                    applier.apply(steps=selected_steps)
+                    ok  = sum(1 for s, _ in applier.actions if s == "OK")
+                    dry = sum(1 for s, _ in applier.actions if s == "DRY")
+                    err = sum(1 for s, _ in applier.actions if s == "ERROR")
+                    self.app.call_from_thread(self.app.notify, f"{ok} applied · {dry} dry-run · {err} errors", title="apply done", severity="error" if err else "information")
 
     # ── Diff Panel ────────────────────────────────────────────────────────────────────────────────
 
