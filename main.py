@@ -626,15 +626,397 @@ def collect_security() -> dict:
     }
 
 
-def collect_notes() -> dict:
-    """Collect user-defined notes. Override this to add system-specific annotations."""
+# ═══════════════════════════════════════════════════════════════════════════════
+# NOTE MODULES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _load_archero_config() -> dict:
+    """Load user config from ~/.config/archero/config.json."""
+    cfg_file = Path.home() / ".config" / "archero" / "config.json"
+    if cfg_file.exists():
+        try:
+            return json.loads(cfg_file.read_text())
+        except Exception:
+            return {}
+    return {}
+
+
+def _notes_amdgpu() -> dict | None:
+    """AMD GPU notes — detect quirks and recommend fixes."""
+    if not Path("/sys/module/amdgpu").exists():
+        return None
+
+    params_dir = Path("/sys/module/amdgpu/parameters")
+    gpu_recovery = read(str(params_dir / "gpu_recovery")) if params_dir.exists() else ""
+    dc = read(str(params_dir / "dc")) if params_dir.exists() else ""
+
+    dri = _find_dri_card()
+    pci = _find_gpu_pci_address()
+
+    # PSR status
+    psr_active = False
+    dri_path = Path(f"/sys/kernel/debug/dri/{dri}")
+    if dri_path.is_dir():
+        for conn in sorted(dri_path.iterdir()):
+            if (conn / "psr_state").exists():
+                state = sysfs(str(conn / "psr_state"))
+                if state and "inactive" not in state.lower():
+                    psr_active = True
+
+    # Runtime PM
+    rpm_status = ""
+    if pci:
+        rpm_path = Path(f"/sys/bus/pci/devices/{pci}/power/runtime_status")
+        if rpm_path.exists():
+            rpm_status = sysfs(str(rpm_path))
+
+    status = {
+        "module": "amdgpu",
+        "gpu_recovery": gpu_recovery,
+        "dc": dc,
+        "psr_active": psr_active,
+        "runtime_pm": rpm_status,
+        "dri_card": dri,
+        "pci_address": pci,
+    }
+
+    quirks = []
+    if not psr_active:
+        quirks.append({
+            "id": "psr-inactive",
+            "summary": "Panel Self Refresh (PSR) not active — may increase idle power on laptops",
+            "reference": "https://wiki.archlinux.org/title/AMDGPU#Panel_Self_Refresh_(PSR)",
+        })
+    if rpm_status and "active" not in rpm_status:
+        quirks.append({
+            "id": "runtime-pm-unavailable",
+            "summary": f"GPU runtime PM status: {rpm_status} — expected on some APUs",
+            "reference": "",
+        })
+
+    recommendations = []
+    if gpu_recovery != "1":
+        recommendations.append({
+            "action": "Enable GPU recovery for hibernate stability",
+            "reason": "amdgpu.gpu_recovery=1 helps resume from hibernate on AMD GPUs",
+            "command": "Add 'amdgpu.gpu_recovery=1' to kernel cmdline in bootloader config",
+        })
+    if dc == "0":
+        recommendations.append({
+            "action": "Remove amdgpu.dc=0 from kernel cmdline",
+            "reason": "Disabling display core breaks Plymouth and can cause visual glitches",
+            "command": "Remove 'amdgpu.dc=0' from GRUB_CMDLINE_LINUX_DEFAULT",
+        })
+
+    return {"detected": True, "status": status, "quirks": quirks, "recommendations": recommendations}
+
+
+def _notes_nvidia() -> dict | None:
+    """Nvidia GPU notes — driver version, power, wayland compat."""
+    if not Path("/sys/module/nvidia").exists():
+        return None
+
+    version = read("/sys/module/nvidia/version")
+    power_mode = read("/sys/module/nvidia/parameters/NVreg_DynamicPowerManagement")
+    session_type = os.environ.get("XDG_SESSION_TYPE", "")
+
+    status = {
+        "module": "nvidia",
+        "driver_version": version or run("nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null"),
+        "dynamic_power_mgmt": power_mode,
+        "session_type": session_type,
+    }
+
+    quirks = []
+    if session_type == "wayland" and version:
+        try:
+            major = int(version.split(".")[0])
+            if major < 535:
+                quirks.append({
+                    "id": "nvidia-wayland-old-driver",
+                    "summary": f"Nvidia driver {version} may have Wayland issues — 535+ recommended",
+                    "reference": "https://wiki.archlinux.org/title/NVIDIA#Wayland",
+                })
+        except ValueError:
+            pass
+
+    recommendations = []
+    if power_mode != "0x02":
+        recommendations.append({
+            "action": "Enable fine-grained power management",
+            "reason": "Reduces idle power on Nvidia Turing+ GPUs",
+            "command": "Set 'options nvidia NVreg_DynamicPowerManagement=0x02' in /etc/modprobe.d/nvidia.conf",
+        })
+
+    return {"detected": True, "status": status, "quirks": quirks, "recommendations": recommendations}
+
+
+def _notes_intel_gpu() -> dict | None:
+    """Intel GPU notes — GuC/HuC, PSR, power."""
+    if not Path("/sys/module/i915").exists():
+        return None
+
+    params = Path("/sys/module/i915/parameters")
+    enable_guc = read(str(params / "enable_guc")) if params.exists() else ""
+    enable_psr = read(str(params / "enable_psr")) if params.exists() else ""
+
+    status = {
+        "module": "i915",
+        "enable_guc": enable_guc,
+        "enable_psr": enable_psr,
+    }
+
+    quirks = []
+    if enable_psr == "1":
+        quirks.append({
+            "id": "i915-psr-flickering",
+            "summary": "PSR enabled — may cause screen flickering on some panels",
+            "reference": "https://wiki.archlinux.org/title/Intel_graphics#Screen_flickering",
+        })
+
+    recommendations = []
+    if enable_guc in ("0", ""):
+        recommendations.append({
+            "action": "Consider enabling GuC/HuC firmware loading",
+            "reason": "Enables hardware scheduling and video decode offload on Gen12+",
+            "command": "Add 'i915.enable_guc=3' to kernel cmdline",
+        })
+
+    return {"detected": True, "status": status, "quirks": quirks, "recommendations": recommendations}
+
+
+def _notes_hibernate() -> dict | None:
+    """Hibernate/suspend notes — swap config, resume, wakeup sources."""
+    cmdline = read("/proc/cmdline")
+    has_resume = "resume=" in cmdline or "resume_offset=" in cmdline
+
+    # Check swap
+    swap_info = run_lines("swapon --show=NAME,TYPE,SIZE --noheadings 2>/dev/null")
+    if not swap_info and not has_resume:
+        return None
+
+    # Wakeup sources
+    wakeup_enabled = []
+    acpi_wakeup = run("cat /proc/acpi/wakeup 2>/dev/null")
+    for line in acpi_wakeup.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[2] == "*enabled":
+            wakeup_enabled.append(parts[0])
+
+    status = {
+        "swap_devices": swap_info,
+        "resume_in_cmdline": has_resume,
+        "wakeup_sources_enabled": wakeup_enabled,
+    }
+
+    quirks = []
+    if wakeup_enabled:
+        known_problematic = {"GP11", "GP12", "XHC0", "XHC1"}
+        problematic = [s for s in wakeup_enabled if s in known_problematic]
+        if problematic:
+            quirks.append({
+                "id": "wakeup-source-conflict",
+                "summary": f"Wakeup sources {', '.join(problematic)} may cause immediate wake from suspend/hibernate",
+                "reference": "https://wiki.archlinux.org/title/Power_management/Suspend_and_hibernate#Instantaneous_wakeups_from_suspend",
+            })
+
+    recommendations = []
+    if swap_info and not has_resume:
+        recommendations.append({
+            "action": "Add resume= to kernel cmdline for hibernate support",
+            "reason": "Swap is configured but kernel has no resume device — hibernate won't work",
+            "command": "Add 'resume=/dev/<swap_device>' and 'resume_offset=<offset>' to bootloader config",
+        })
+
+    return {"detected": True, "status": status, "quirks": quirks, "recommendations": recommendations}
+
+
+def _notes_bootloader() -> dict | None:
+    """Bootloader notes — detect current bootloader and snapshot support."""
+    bootloader = "unknown"
+    if Path("/boot/grub/grub.cfg").exists() or Path("/boot/grub2/grub.cfg").exists():
+        bootloader = "grub"
+    elif Path("/boot/loader/loader.conf").exists():
+        bootloader = "systemd-boot"
+    elif Path("/boot/limine.cfg").exists() or Path("/boot/limine/limine.conf").exists():
+        bootloader = "limine"
+    else:
+        return None
+
+    btrfs_root = run("findmnt -n -o FSTYPE / 2>/dev/null").strip() == "btrfs"
+    grub_btrfs = Path("/etc/grub.d/41_snapshots-btrfs").exists()
+
+    status = {
+        "bootloader": bootloader,
+        "btrfs_root": btrfs_root,
+        "grub_btrfs_installed": grub_btrfs if bootloader == "grub" else None,
+    }
+
+    quirks = []
+    recommendations = []
+
+    if bootloader == "grub" and btrfs_root and not grub_btrfs:
+        recommendations.append({
+            "action": "Install grub-btrfs for snapshot boot entries",
+            "reason": "Enables booting into btrfs snapshots from GRUB menu",
+            "command": "paru -S grub-btrfs && sudo systemctl enable --now grub-btrfsd",
+        })
+
+    return {"detected": True, "status": status, "quirks": quirks, "recommendations": recommendations}
+
+
+def _notes_desktop() -> dict | None:
+    """Desktop environment notes — session type and known quirks."""
+    desktop = os.environ.get("XDG_CURRENT_DESKTOP", "")
+    session = os.environ.get("XDG_SESSION_TYPE", "")
+    if not desktop:
+        return None
+
+    status = {
+        "desktop": desktop,
+        "session_type": session,
+        "wayland_display": os.environ.get("WAYLAND_DISPLAY", ""),
+    }
+
+    quirks = []
+    recommendations = []
+
+    desktop_lower = desktop.lower()
+    if "kde" in desktop_lower and session == "wayland":
+        if not Path("/usr/lib/qt6/plugins/wayland-decoration-client").exists():
+            quirks.append({
+                "id": "kde-wayland-decoration-missing",
+                "summary": "Qt6 Wayland decoration plugin missing — some apps may lack window decorations",
+                "reference": "",
+            })
+
+    if "hyprland" in desktop_lower:
+        xdg_portal = run("pacman -Q xdg-desktop-portal-hyprland 2>/dev/null")
+        if not xdg_portal:
+            recommendations.append({
+                "action": "Install xdg-desktop-portal-hyprland",
+                "reason": "Required for screen sharing and file dialogs under Hyprland",
+                "command": "paru -S xdg-desktop-portal-hyprland",
+            })
+
+    return {"detected": True, "status": status, "quirks": quirks, "recommendations": recommendations}
+
+
+def _notes_power() -> dict | None:
+    """Power notes — battery, wifi PM, NVMe APST."""
+    bat_path = Path("/sys/class/power_supply/BAT0")
+    if not bat_path.exists():
+        bat_path = Path("/sys/class/power_supply/BAT1")
+        if not bat_path.exists():
+            return None
+
+    wifi_ps = ""
+    wifi_dev = run("iw dev 2>/dev/null | awk '/Interface/{print $2}' | head -1")
+    if wifi_dev:
+        ps_output = run(f"iw dev {wifi_dev} get power_save 2>/dev/null")
+        wifi_ps = "on" if "on" in ps_output.lower() else "off" if "off" in ps_output.lower() else ps_output
+
+    # NVMe power state
+    nvme_pm = {}
+    for rule_file in sorted(Path("/etc/udev/rules.d").glob("*nvme*")) if Path("/etc/udev/rules.d").is_dir() else []:
+        nvme_pm[rule_file.name] = read(str(rule_file))[:200]
+
+    status = {
+        "battery": bat_path.name,
+        "wifi_power_save": wifi_ps,
+        "wifi_device": wifi_dev,
+        "nvme_udev_rules": list(nvme_pm.keys()),
+    }
+
+    quirks = []
+    recommendations = []
+
+    if wifi_ps == "on":
+        recommendations.append({
+            "action": "Consider disabling wifi power save if experiencing disconnects",
+            "reason": "Some wifi chipsets (MediaTek, Intel AX) have stability issues with power_save on",
+            "command": f"iw dev {wifi_dev} set power_save off",
+        })
+
+    return {"detected": True, "status": status, "quirks": quirks, "recommendations": recommendations}
+
+
+def _notes_kernel_modules() -> dict | None:
+    """Kernel module blacklist notes — scan /etc/modprobe.d/ for blacklists."""
+    modprobe_dir = Path("/etc/modprobe.d")
+    if not modprobe_dir.is_dir():
+        return None
+
+    blacklisted = {}
+    for conf in sorted(modprobe_dir.glob("*.conf")):
+        content = read(str(conf))
+        for line in content.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("blacklist "):
+                mod = stripped.split(None, 1)[1].strip()
+                blacklisted[mod] = conf.name
+
+    if not blacklisted:
+        return None
+
+    status = {
+        "blacklisted_modules": blacklisted,
+        "config_files": sorted({v for v in blacklisted.values()}),
+    }
+
+    return {"detected": True, "status": status, "quirks": [], "recommendations": []}
+
+
+NOTE_MODULES: dict[str, callable] = {
+    "amdgpu": _notes_amdgpu,
+    "nvidia": _notes_nvidia,
+    "intel_gpu": _notes_intel_gpu,
+    "hibernate": _notes_hibernate,
+    "bootloader": _notes_bootloader,
+    "desktop": _notes_desktop,
+    "power": _notes_power,
+    "kernel_modules": _notes_kernel_modules,
+}
+
+
+def collect_notes(note_modules: list[str] | None = None,
+                  disable_note_modules: list[str] | None = None) -> dict:
+    """Run auto-detecting note modules. Merge with user notes."""
+    config = _load_archero_config()
+    cfg_disabled = set(config.get("note_modules", {}).get("disabled", []))
+    cfg_enabled = config.get("note_modules", {}).get("enabled", [])
+
+    # CLI --note-modules overrides everything
+    if note_modules:
+        active = {m for m in note_modules if m in NOTE_MODULES}
+    else:
+        active = set(NOTE_MODULES.keys()) | set(cfg_enabled)
+        active -= cfg_disabled
+
+    # CLI --disable-note-modules stacks on top
+    if disable_note_modules:
+        active -= set(disable_note_modules)
+
+    results = {}
+    for name in sorted(active):
+        if name not in NOTE_MODULES:
+            continue
+        try:
+            result = NOTE_MODULES[name]()
+            if result is not None:
+                results[name] = result
+        except Exception as e:
+            results[name] = {"detected": False, "error": str(e)}
+
+    # Merge user notes
     notes_file = Path.home() / ".config" / "archero" / "notes.json"
     if notes_file.exists():
         try:
-            return json.loads(notes_file.read_text())
+            results["user"] = json.loads(notes_file.read_text())
         except Exception as e:
-            return {"error": str(e)}
-    return {}
+            results["user"] = {"error": str(e)}
+
+    return results
 
 
 ALL_COLLECTORS = {
@@ -1086,7 +1468,13 @@ def cmd_snapshot(args):
     for name in selected:
         print(f"  [{name}]...", end=" ", flush=True)
         try:
-            snapshot[name] = ALL_COLLECTORS[name]()
+            if name == "notes":
+                snapshot[name] = collect_notes(
+                    note_modules=getattr(args, 'note_modules', None),
+                    disable_note_modules=getattr(args, 'disable_note_modules', None),
+                )
+            else:
+                snapshot[name] = ALL_COLLECTORS[name]()
             print("ok")
         except Exception as e:
             snapshot[name] = {"error": str(e)}
@@ -2234,6 +2622,12 @@ def main():
     p_snap.add_argument("--pretty", "-p", action="store_true", help="Pretty-print JSON")
     p_snap.add_argument("--sections", "-s", nargs="+", choices=list(ALL_COLLECTORS.keys()),
                         help="Only collect specific sections")
+    p_snap.add_argument("--note-modules", nargs="+",
+                        choices=list(NOTE_MODULES.keys()),
+                        help="Only run these note modules (overrides config)")
+    p_snap.add_argument("--disable-note-modules", nargs="+",
+                        choices=list(NOTE_MODULES.keys()),
+                        help="Skip these note modules")
 
     # apply
     p_apply = sub.add_parser("apply", help="Restore system from a snapshot JSON")
