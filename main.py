@@ -1856,6 +1856,13 @@ Screen {
     margin-bottom: 1;
 }
 
+.snap-list {
+    max-height: 6;
+    height: auto;
+    border: solid $primary-darken-2;
+    margin-bottom: 1;
+}
+
 Button {
     margin-top: 1;
 }
@@ -1980,7 +1987,7 @@ def launch_tui():
         def compose(self) -> ComposeResult:
             yield Label("snapshot file")
             yield Input(placeholder="type or select below...", id="apply-path")
-            yield ListView(id="apply-snap-list")
+            yield ListView(id="apply-snap-list", classes="snap-list")
             yield Label("steps")
             with Container(classes="section-grid"):
                 for step in self.STEPS:
@@ -2063,51 +2070,58 @@ def launch_tui():
 
     class DiffPanel(Container):
         _snaps: list = []
-        _active_input: str = "diff-a"  # tracks which input the list is serving
 
         def compose(self) -> ComposeResult:
             yield Label("file A  (older / saved snapshot)")
             yield Input(placeholder="type to search snapshots...", id="diff-a")
+            yield ListView(id="diff-list-a", classes="snap-list")
             yield Label("file B  (newer — leave blank to compare vs live system)")
             yield Input(placeholder="type to search or leave empty for live system", id="diff-b")
-            yield ListView(id="diff-snap-list")
+            yield ListView(id="diff-list-b", classes="snap-list")
             yield Button("compare ↵", id="btn-diff", variant="success")
             with Horizontal(id="diff-container"):
                 yield Log(id="diff-left",  auto_scroll=False, classes="diff-panel")
                 yield Log(id="diff-right", auto_scroll=False, classes="diff-panel")
 
         def on_mount(self):
-            self._refresh_list("")
-
-        def _refresh_list(self, q: str):
             self._snaps = _list_snapshots()
-            lv = self.query_one("#diff-snap-list", ListView)
+            self._refresh_list("diff-list-a", "")
+            self._refresh_list("diff-list-b", "")
+
+        def _refresh_list(self, list_id: str, q: str):
+            self._snaps = _list_snapshots()
+            lv = self.query_one(f"#{list_id}", ListView)
             lv.clear()
-            # Blank option — for file B this means "compare vs live system"
-            lv.append(ListItem(Label("[dim](none — use live system)[/dim]")))
+            if list_id == "diff-list-b":
+                lv.append(ListItem(Label("(live system)"), id="opt-live"))
             for path in self._snaps:
                 if not q or q.lower() in path.lower():
                     lv.append(ListItem(Label(Path(path).name)))
 
         def on_input_changed(self, event: Input.Changed):
-            if event.input.id in ("diff-a", "diff-b"):
-                self._active_input = event.input.id
-                self._refresh_list(event.value)
+            if event.input.id == "diff-a":
+                self._refresh_list("diff-list-a", event.value)
+            elif event.input.id == "diff-b":
+                self._refresh_list("diff-list-b", event.value)
 
         def on_list_view_selected(self, event: ListView.Selected):
-            if event.list_view.id == "diff-snap-list":
-                try:
-                    name = str(event.item.query_one(Label).renderable)
-                    target = self.query_one(f"#{self._active_input}", Input)
-                    if name.startswith("[dim]"):
-                        target.value = ""
-                        return
-                    for path in self._snaps:
-                        if Path(path).name == name:
-                            target.value = path
-                            break
-                except Exception:
-                    pass
+            # Map each list to its input
+            target_map = {"diff-list-a": "diff-a", "diff-list-b": "diff-b"}
+            input_id = target_map.get(event.list_view.id)
+            if not input_id:
+                return
+            try:
+                label_text = str(event.item.query_one(Label).renderable)
+                target = self.query_one(f"#{input_id}", Input)
+                if label_text.startswith("(live"):
+                    target.value = ""
+                    return
+                for path in self._snaps:
+                    if Path(path).name == label_text:
+                        target.value = path
+                        break
+            except Exception:
+                pass
 
         def on_button_pressed(self, event: Button.Pressed):
             if event.button.id == "btn-diff":
@@ -2519,21 +2533,23 @@ def launch_tui():
 
                 # Input: down-arrow jumps to the associated ListView below
                 if isinstance(focused, Input):
-                    # Track which input is active for DiffPanel
-                    if focused.id in ("diff-a", "diff-b"):
-                        try:
-                            dp = self.query_one("#panel-diff")
-                            dp._active_input = focused.id
-                        except Exception:
-                            pass
                     if key == "down":
                         event.stop()
-                        # Find the next ListView sibling in the same panel
+                        # Map inputs to their paired ListView
+                        input_list_map = {
+                            "diff-a": "diff-list-a",
+                            "diff-b": "diff-list-b",
+                            "apply-path": "apply-snap-list",
+                        }
+                        list_id = input_list_map.get(focused.id)
                         try:
-                            panel = self.query_one(f"#panel-{self._active_panel}")
-                            lv = panel.query("ListView")
-                            if lv:
-                                self.set_focus(lv.first())
+                            if list_id:
+                                self.set_focus(self.query_one(f"#{list_id}", ListView))
+                            else:
+                                panel = self.query_one(f"#panel-{self._active_panel}")
+                                lv = panel.query("ListView")
+                                if lv:
+                                    self.set_focus(lv.first())
                         except Exception:
                             self.action_focus_next()
                         return
