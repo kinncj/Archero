@@ -28,6 +28,7 @@ env/
 *~
 .DS_Store
 CLAUDE.md
+docs/superpowers
 
 # Textual dev files
 .textual/
