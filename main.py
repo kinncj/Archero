@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Archero — main.py
-==================
+Archero — ~/.dotfiles/archero/main.py
+======================================
 System snapshot, restore, and diff tool for CachyOS and Arch Linux.
 Includes a full TUI (launched when run with no arguments).
 
@@ -17,21 +17,21 @@ MODES:
 
 USAGE:
     # TUI
-    ./main.py
+    ~/.dotfiles/archero/main.py
 
     # Capture
-    sudo ./main.py snapshot
-    sudo ./main.py snapshot --pretty
-    sudo ./main.py snapshot --output my-snapshot.json
+    sudo ~/.dotfiles/archero/main.py snapshot
+    sudo ~/.dotfiles/archero/main.py snapshot --pretty
+    sudo ~/.dotfiles/archero/main.py snapshot --output my-snapshot.json
 
     # Restore (dry-run by default, shows what would happen)
-    sudo ./main.py apply my-snapshot.json
-    sudo ./main.py apply my-snapshot.json --confirm
-    sudo ./main.py apply my-snapshot.json --steps packages dotfiles
+    sudo ~/.dotfiles/archero/main.py apply my-snapshot.json
+    sudo ~/.dotfiles/archero/main.py apply my-snapshot.json --confirm
+    sudo ~/.dotfiles/archero/main.py apply my-snapshot.json --steps packages dotfiles
 
     # Diff two snapshots (or one snapshot vs live system)
-    ./main.py diff snapshot-old.json
-    ./main.py diff snapshot-old.json snapshot-new.json
+    ~/.dotfiles/archero/main.py diff snapshot-old.json
+    ~/.dotfiles/archero/main.py diff snapshot-old.json snapshot-new.json
 """
 
 import subprocess
@@ -49,8 +49,14 @@ from pathlib import Path
 # PATHS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-SNAPSHOT_DIR = Path.home() / ".config" / "archero" / "snapshots"
-SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+def _get_snapshot_dir() -> Path:
+    sudo_user = os.environ.get("SUDO_USER", "")
+    home = Path(f"/home/{sudo_user}") if sudo_user else Path.home()
+    d = home / ".config" / "archero" / "snapshots"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+SNAPSHOT_DIR = _get_snapshot_dir()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # PRIMITIVES
@@ -518,54 +524,22 @@ def collect_power() -> dict:
     }
 
 
-def _find_dri_card() -> str:
-    """Find the first DRI card directory with amdgpu_pm_info."""
-    for i in range(8):
-        if Path(f"/sys/kernel/debug/dri/{i}/amdgpu_pm_info").exists():
-            return str(i)
-    return "0"
-
-
-def _find_gpu_pci_address() -> str:
-    """Find the first GPU PCI address via lspci."""
-    for line in run_lines("lspci | grep -iE 'vga|display|3d'"):
-        addr = line.split(" ", 1)[0]
-        if addr:
-            return f"0000:{addr}"
-    return ""
-
-
 def collect_gpu() -> dict:
-    dri = _find_dri_card()
-    pci = _find_gpu_pci_address()
-    psr = {}
-    # Scan for PSR-capable connectors
-    dri_path = Path(f"/sys/kernel/debug/dri/{dri}")
-    if dri_path.is_dir():
-        for conn in sorted(dri_path.iterdir()):
-            if (conn / "psr_state").exists():
-                psr[conn.name] = {
-                    "state": sysfs(str(conn / "psr_state")),
-                    "residency": sysfs(str(conn / "psr_residency")),
-                    "capability": read(str(conn / "psr_capability")),
-                }
-    runtime_pm = {}
-    if pci:
-        pci_power = Path(f"/sys/bus/pci/devices/{pci}/power")
-        if pci_power.is_dir():
-            runtime_pm = {
-                "pci_address": pci,
-                "status": sysfs(str(pci_power / "runtime_status")),
-                "control": sysfs(str(pci_power / "control")),
-            }
     return {
         "gpu_devices": [
             {"address": l.split(" ", 1)[0], "description": l.split(" ", 1)[1] if " " in l else ""}
             for l in run_lines("lspci | grep -iE 'vga|display|3d'")
         ],
-        "amdgpu_pm_info": run(f"cat /sys/kernel/debug/dri/{dri}/amdgpu_pm_info 2>/dev/null | head -20"),
-        "psr": psr,
-        "runtime_pm": runtime_pm,
+        "amdgpu_pm_info": run("cat /sys/kernel/debug/dri/1/amdgpu_pm_info 2>/dev/null | head -20"),
+        "psr": {
+            "state": sysfs("/sys/kernel/debug/dri/1/eDP-1/psr_state"),
+            "residency": sysfs("/sys/kernel/debug/dri/1/eDP-1/psr_residency"),
+            "capability": read("/sys/kernel/debug/dri/1/eDP-1/psr_capability"),
+        },
+        "runtime_pm": {
+            "status": sysfs("/sys/bus/pci/devices/0000:c3:00.0/power/runtime_status"),
+            "control": sysfs("/sys/bus/pci/devices/0000:c3:00.0/power/control"),
+        },
         "session": {
             "wayland_display": os.environ.get("WAYLAND_DISPLAY", ""),
             "xdg_session_type": os.environ.get("XDG_SESSION_TYPE", ""),
@@ -626,397 +600,60 @@ def collect_security() -> dict:
     }
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# NOTE MODULES
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _load_archero_config() -> dict:
-    """Load user config from ~/.config/archero/config.json."""
-    cfg_file = Path.home() / ".config" / "archero" / "config.json"
-    if cfg_file.exists():
-        try:
-            return json.loads(cfg_file.read_text())
-        except Exception:
-            return {}
-    return {}
-
-
-def _notes_amdgpu() -> dict | None:
-    """AMD GPU notes — detect quirks and recommend fixes."""
-    if not Path("/sys/module/amdgpu").exists():
-        return None
-
-    params_dir = Path("/sys/module/amdgpu/parameters")
-    gpu_recovery = read(str(params_dir / "gpu_recovery")) if params_dir.exists() else ""
-    dc = read(str(params_dir / "dc")) if params_dir.exists() else ""
-
-    dri = _find_dri_card()
-    pci = _find_gpu_pci_address()
-
-    # PSR status
-    psr_active = False
-    dri_path = Path(f"/sys/kernel/debug/dri/{dri}")
-    if dri_path.is_dir():
-        for conn in sorted(dri_path.iterdir()):
-            if (conn / "psr_state").exists():
-                state = sysfs(str(conn / "psr_state"))
-                if state and "inactive" not in state.lower():
-                    psr_active = True
-
-    # Runtime PM
-    rpm_status = ""
-    if pci:
-        rpm_path = Path(f"/sys/bus/pci/devices/{pci}/power/runtime_status")
-        if rpm_path.exists():
-            rpm_status = sysfs(str(rpm_path))
-
-    status = {
-        "module": "amdgpu",
-        "gpu_recovery": gpu_recovery,
-        "dc": dc,
-        "psr_active": psr_active,
-        "runtime_pm": rpm_status,
-        "dri_card": dri,
-        "pci_address": pci,
+def collect_notes() -> dict:
+    return {
+        "webcam_isp4": {
+            "status": "blacklisted",
+            "reason": "suspend/resume hang when camera module loaded",
+            "patch_repo": "github.com/kinncj/amdisp4",
+            "upstream_patch": "linux-media@vger.kernel.org, March 2026",
+            "module_rename": "amd_capture -> amd_isp4_capture (recent kernels)",
+            "tracking": "kernel 7.0-rc5, Pratap Nirujogi probe fix (20260311174251)",
+            "reference": "github.com/jtsiros/amd-isp4-camera",
+        },
+        "hibernate": {
+            "status": "working",
+            "swapfile": "/swap/swapfile",
+            "subvolume": "@swap (ID 339, top level 5, outside snapshot scope)",
+            "resume_offset": "49816832",
+            "wakeup_fix": "GP11, GP12, XHC1 disabled via disable-s4-wakeup.service",
+            "amdgpu_fix": "amdgpu.gpu_recovery=1 in GRUB cmdline",
+            "battery_drain": "~1% per hour",
+        },
+        "amdgpu": {
+            "runtime_pm": "not available on Strix Halo APU — expected",
+            "psr": "configured but not activating — known Strix Halo issue",
+            "dc0_warning": "amdgpu.dc=0 breaks Plymouth — do not use",
+            "gpu_recovery": "amdgpu.gpu_recovery=1 required for hibernate resume",
+        },
+        "bootloader": {
+            "current": "GRUB",
+            "previous": "Limine",
+            "snapshot_support": "grub-btrfs auto-detects btrfs snapshots",
+            "rollback_snapshot": "281 (pre-Hyprland migration checkpoint)",
+        },
+        "desktop": {
+            "current": "KDE Plasma on Wayland",
+            "previous": "Hyprland (rolled back)",
+            "rollback_snapshot": "281",
+        },
+        "packages": {
+            "aur_helper": "paru (not yay)",
+            "primary_kernel": "linux-cachyos",
+            "fallback_kernel": "linux-cachyos-lts",
+        },
+        "power": {
+            "baseline_idle_w": "14-18W at 120Hz, 100% brightness, VRR on",
+            "tuned_idle_w": "8-10W at 48Hz, 50% brightness, VRR off",
+            "wifi_power_save": "OFF — MediaTek mt7925 stability",
+            "nvme_power": "auto via /etc/udev/rules.d/91-nvme-powersave.rules",
+        },
+        "upstream_contributions": [
+            {"project": "AMD ISP4 suspend/resume", "repo": "github.com/kinncj/amdisp4"},
+            {"project": "Safe Discover", "description": "Plasma Discover replacement for Arch/CachyOS"},
+            {"project": "AI-Squad", "repo": "github.com/kinncj/AI-Squad"},
+        ],
     }
-
-    quirks = []
-    if not psr_active:
-        quirks.append({
-            "id": "psr-inactive",
-            "summary": "Panel Self Refresh (PSR) not active — may increase idle power on laptops",
-            "reference": "https://wiki.archlinux.org/title/AMDGPU#Panel_Self_Refresh_(PSR)",
-        })
-    if rpm_status and "active" not in rpm_status:
-        quirks.append({
-            "id": "runtime-pm-unavailable",
-            "summary": f"GPU runtime PM status: {rpm_status} — expected on some APUs",
-            "reference": "",
-        })
-
-    recommendations = []
-    if gpu_recovery != "1":
-        recommendations.append({
-            "action": "Enable GPU recovery for hibernate stability",
-            "reason": "amdgpu.gpu_recovery=1 helps resume from hibernate on AMD GPUs",
-            "command": "Add 'amdgpu.gpu_recovery=1' to kernel cmdline in bootloader config",
-        })
-    if dc == "0":
-        recommendations.append({
-            "action": "Remove amdgpu.dc=0 from kernel cmdline",
-            "reason": "Disabling display core breaks Plymouth and can cause visual glitches",
-            "command": "Remove 'amdgpu.dc=0' from GRUB_CMDLINE_LINUX_DEFAULT",
-        })
-
-    return {"detected": True, "status": status, "quirks": quirks, "recommendations": recommendations}
-
-
-def _notes_nvidia() -> dict | None:
-    """Nvidia GPU notes — driver version, power, wayland compat."""
-    if not Path("/sys/module/nvidia").exists():
-        return None
-
-    version = read("/sys/module/nvidia/version")
-    power_mode = read("/sys/module/nvidia/parameters/NVreg_DynamicPowerManagement")
-    session_type = os.environ.get("XDG_SESSION_TYPE", "")
-
-    status = {
-        "module": "nvidia",
-        "driver_version": version or run("nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null"),
-        "dynamic_power_mgmt": power_mode,
-        "session_type": session_type,
-    }
-
-    quirks = []
-    if session_type == "wayland" and version:
-        try:
-            major = int(version.split(".")[0])
-            if major < 535:
-                quirks.append({
-                    "id": "nvidia-wayland-old-driver",
-                    "summary": f"Nvidia driver {version} may have Wayland issues — 535+ recommended",
-                    "reference": "https://wiki.archlinux.org/title/NVIDIA#Wayland",
-                })
-        except ValueError:
-            pass
-
-    recommendations = []
-    if power_mode != "0x02":
-        recommendations.append({
-            "action": "Enable fine-grained power management",
-            "reason": "Reduces idle power on Nvidia Turing+ GPUs",
-            "command": "Set 'options nvidia NVreg_DynamicPowerManagement=0x02' in /etc/modprobe.d/nvidia.conf",
-        })
-
-    return {"detected": True, "status": status, "quirks": quirks, "recommendations": recommendations}
-
-
-def _notes_intel_gpu() -> dict | None:
-    """Intel GPU notes — GuC/HuC, PSR, power."""
-    if not Path("/sys/module/i915").exists():
-        return None
-
-    params = Path("/sys/module/i915/parameters")
-    enable_guc = read(str(params / "enable_guc")) if params.exists() else ""
-    enable_psr = read(str(params / "enable_psr")) if params.exists() else ""
-
-    status = {
-        "module": "i915",
-        "enable_guc": enable_guc,
-        "enable_psr": enable_psr,
-    }
-
-    quirks = []
-    if enable_psr == "1":
-        quirks.append({
-            "id": "i915-psr-flickering",
-            "summary": "PSR enabled — may cause screen flickering on some panels",
-            "reference": "https://wiki.archlinux.org/title/Intel_graphics#Screen_flickering",
-        })
-
-    recommendations = []
-    if enable_guc in ("0", ""):
-        recommendations.append({
-            "action": "Consider enabling GuC/HuC firmware loading",
-            "reason": "Enables hardware scheduling and video decode offload on Gen12+",
-            "command": "Add 'i915.enable_guc=3' to kernel cmdline",
-        })
-
-    return {"detected": True, "status": status, "quirks": quirks, "recommendations": recommendations}
-
-
-def _notes_hibernate() -> dict | None:
-    """Hibernate/suspend notes — swap config, resume, wakeup sources."""
-    cmdline = read("/proc/cmdline")
-    has_resume = "resume=" in cmdline or "resume_offset=" in cmdline
-
-    # Check swap
-    swap_info = run_lines("swapon --show=NAME,TYPE,SIZE --noheadings 2>/dev/null")
-    if not swap_info and not has_resume:
-        return None
-
-    # Wakeup sources
-    wakeup_enabled = []
-    acpi_wakeup = run("cat /proc/acpi/wakeup 2>/dev/null")
-    for line in acpi_wakeup.splitlines():
-        parts = line.split()
-        if len(parts) >= 3 and parts[2] == "*enabled":
-            wakeup_enabled.append(parts[0])
-
-    status = {
-        "swap_devices": swap_info,
-        "resume_in_cmdline": has_resume,
-        "wakeup_sources_enabled": wakeup_enabled,
-    }
-
-    quirks = []
-    if wakeup_enabled:
-        known_problematic = {"GP11", "GP12", "XHC0", "XHC1"}
-        problematic = [s for s in wakeup_enabled if s in known_problematic]
-        if problematic:
-            quirks.append({
-                "id": "wakeup-source-conflict",
-                "summary": f"Wakeup sources {', '.join(problematic)} may cause immediate wake from suspend/hibernate",
-                "reference": "https://wiki.archlinux.org/title/Power_management/Suspend_and_hibernate#Instantaneous_wakeups_from_suspend",
-            })
-
-    recommendations = []
-    if swap_info and not has_resume:
-        recommendations.append({
-            "action": "Add resume= to kernel cmdline for hibernate support",
-            "reason": "Swap is configured but kernel has no resume device — hibernate won't work",
-            "command": "Add 'resume=/dev/<swap_device>' and 'resume_offset=<offset>' to bootloader config",
-        })
-
-    return {"detected": True, "status": status, "quirks": quirks, "recommendations": recommendations}
-
-
-def _notes_bootloader() -> dict | None:
-    """Bootloader notes — detect current bootloader and snapshot support."""
-    bootloader = "unknown"
-    if Path("/boot/grub/grub.cfg").exists() or Path("/boot/grub2/grub.cfg").exists():
-        bootloader = "grub"
-    elif Path("/boot/loader/loader.conf").exists():
-        bootloader = "systemd-boot"
-    elif Path("/boot/limine.cfg").exists() or Path("/boot/limine/limine.conf").exists():
-        bootloader = "limine"
-    else:
-        return None
-
-    btrfs_root = run("findmnt -n -o FSTYPE / 2>/dev/null").strip() == "btrfs"
-    grub_btrfs = Path("/etc/grub.d/41_snapshots-btrfs").exists()
-
-    status = {
-        "bootloader": bootloader,
-        "btrfs_root": btrfs_root,
-        "grub_btrfs_installed": grub_btrfs if bootloader == "grub" else None,
-    }
-
-    quirks = []
-    recommendations = []
-
-    if bootloader == "grub" and btrfs_root and not grub_btrfs:
-        recommendations.append({
-            "action": "Install grub-btrfs for snapshot boot entries",
-            "reason": "Enables booting into btrfs snapshots from GRUB menu",
-            "command": "paru -S grub-btrfs && sudo systemctl enable --now grub-btrfsd",
-        })
-
-    return {"detected": True, "status": status, "quirks": quirks, "recommendations": recommendations}
-
-
-def _notes_desktop() -> dict | None:
-    """Desktop environment notes — session type and known quirks."""
-    desktop = os.environ.get("XDG_CURRENT_DESKTOP", "")
-    session = os.environ.get("XDG_SESSION_TYPE", "")
-    if not desktop:
-        return None
-
-    status = {
-        "desktop": desktop,
-        "session_type": session,
-        "wayland_display": os.environ.get("WAYLAND_DISPLAY", ""),
-    }
-
-    quirks = []
-    recommendations = []
-
-    desktop_lower = desktop.lower()
-    if "kde" in desktop_lower and session == "wayland":
-        if not Path("/usr/lib/qt6/plugins/wayland-decoration-client").exists():
-            quirks.append({
-                "id": "kde-wayland-decoration-missing",
-                "summary": "Qt6 Wayland decoration plugin missing — some apps may lack window decorations",
-                "reference": "",
-            })
-
-    if "hyprland" in desktop_lower:
-        xdg_portal = run("pacman -Q xdg-desktop-portal-hyprland 2>/dev/null")
-        if not xdg_portal:
-            recommendations.append({
-                "action": "Install xdg-desktop-portal-hyprland",
-                "reason": "Required for screen sharing and file dialogs under Hyprland",
-                "command": "paru -S xdg-desktop-portal-hyprland",
-            })
-
-    return {"detected": True, "status": status, "quirks": quirks, "recommendations": recommendations}
-
-
-def _notes_power() -> dict | None:
-    """Power notes — battery, wifi PM, NVMe APST."""
-    bat_path = Path("/sys/class/power_supply/BAT0")
-    if not bat_path.exists():
-        bat_path = Path("/sys/class/power_supply/BAT1")
-        if not bat_path.exists():
-            return None
-
-    wifi_ps = ""
-    wifi_dev = run("iw dev 2>/dev/null | awk '/Interface/{print $2}' | head -1")
-    if wifi_dev:
-        ps_output = run(f"iw dev {wifi_dev} get power_save 2>/dev/null")
-        wifi_ps = "on" if "on" in ps_output.lower() else "off" if "off" in ps_output.lower() else ps_output
-
-    # NVMe power state
-    nvme_pm = {}
-    for rule_file in sorted(Path("/etc/udev/rules.d").glob("*nvme*")) if Path("/etc/udev/rules.d").is_dir() else []:
-        nvme_pm[rule_file.name] = read(str(rule_file))[:200]
-
-    status = {
-        "battery": bat_path.name,
-        "wifi_power_save": wifi_ps,
-        "wifi_device": wifi_dev,
-        "nvme_udev_rules": list(nvme_pm.keys()),
-    }
-
-    quirks = []
-    recommendations = []
-
-    if wifi_ps == "on":
-        recommendations.append({
-            "action": "Consider disabling wifi power save if experiencing disconnects",
-            "reason": "Some wifi chipsets (MediaTek, Intel AX) have stability issues with power_save on",
-            "command": f"iw dev {wifi_dev} set power_save off",
-        })
-
-    return {"detected": True, "status": status, "quirks": quirks, "recommendations": recommendations}
-
-
-def _notes_kernel_modules() -> dict | None:
-    """Kernel module blacklist notes — scan /etc/modprobe.d/ for blacklists."""
-    modprobe_dir = Path("/etc/modprobe.d")
-    if not modprobe_dir.is_dir():
-        return None
-
-    blacklisted = {}
-    for conf in sorted(modprobe_dir.glob("*.conf")):
-        content = read(str(conf))
-        for line in content.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("blacklist "):
-                mod = stripped.split(None, 1)[1].strip()
-                blacklisted[mod] = conf.name
-
-    if not blacklisted:
-        return None
-
-    status = {
-        "blacklisted_modules": blacklisted,
-        "config_files": sorted({v for v in blacklisted.values()}),
-    }
-
-    return {"detected": True, "status": status, "quirks": [], "recommendations": []}
-
-
-NOTE_MODULES: dict[str, callable] = {
-    "amdgpu": _notes_amdgpu,
-    "nvidia": _notes_nvidia,
-    "intel_gpu": _notes_intel_gpu,
-    "hibernate": _notes_hibernate,
-    "bootloader": _notes_bootloader,
-    "desktop": _notes_desktop,
-    "power": _notes_power,
-    "kernel_modules": _notes_kernel_modules,
-}
-
-
-def collect_notes(note_modules: list[str] | None = None,
-                  disable_note_modules: list[str] | None = None) -> dict:
-    """Run auto-detecting note modules. Merge with user notes."""
-    config = _load_archero_config()
-    cfg_disabled = set(config.get("note_modules", {}).get("disabled", []))
-    cfg_enabled = config.get("note_modules", {}).get("enabled", [])
-
-    # CLI --note-modules overrides everything
-    if note_modules:
-        active = {m for m in note_modules if m in NOTE_MODULES}
-    else:
-        active = set(NOTE_MODULES.keys()) | set(cfg_enabled)
-        active -= cfg_disabled
-
-    # CLI --disable-note-modules stacks on top
-    if disable_note_modules:
-        active -= set(disable_note_modules)
-
-    results = {}
-    for name in sorted(active):
-        if name not in NOTE_MODULES:
-            continue
-        try:
-            result = NOTE_MODULES[name]()
-            if result is not None:
-                results[name] = result
-        except Exception as e:
-            results[name] = {"detected": False, "error": str(e)}
-
-    # Merge user notes
-    notes_file = Path.home() / ".config" / "archero" / "notes.json"
-    if notes_file.exists():
-        try:
-            results["user"] = json.loads(notes_file.read_text())
-        except Exception as e:
-            results["user"] = {"error": str(e)}
-
-    return results
 
 
 ALL_COLLECTORS = {
@@ -1279,264 +916,6 @@ class Applier:
         if resume_uuid and resume_offset:
             self.log("WARN", f"Original resume_offset={resume_offset} — recalculate on new system")
 
-    # ── Plan (terraform-style) ──────────────────────────────────────────────
-
-    def plan(self, steps: list = None):
-        """Show what would change, comparing snapshot desired state vs live system."""
-        available_steps = {
-            "locale":     self._plan_locale,
-            "packages":   self._plan_packages,
-            "dotfiles":   self._plan_dotfiles,
-            "config":     self._plan_config,
-            "services":   self._plan_services,
-            "bootloader": self._plan_bootloader,
-            "swap":       self._plan_swap,
-        }
-        selected = steps or list(available_steps.keys())
-
-        print(f"\n{'═' * 60}")
-        print(f"  PLAN — comparing snapshot vs live system")
-        print(f"  Distro: {self.distro}")
-        print(f"  Steps: {', '.join(selected)}")
-        print(f"{'═' * 60}")
-        print(f"  + create/install   ~ modify   - remove   = unchanged")
-        print(f"{'─' * 60}")
-
-        changes = 0
-        for step_name in selected:
-            if step_name in available_steps:
-                changes += available_steps[step_name]()
-
-        print(f"\n{'═' * 60}")
-        if changes:
-            print(f"  Plan: {changes} change(s). Run with --confirm to apply.")
-        else:
-            print(f"  Plan: no changes needed. System matches snapshot.")
-        print(f"{'═' * 60}\n")
-        return changes
-
-    def _plan_locale(self) -> int:
-        changes = 0
-        cfg = self.snap.get("config", {})
-        print("\n── Locale & Timezone ──")
-
-        locale_conf = cfg.get("locale_conf", "")
-        if locale_conf:
-            current = read("/etc/locale.conf")
-            if current != locale_conf:
-                print(f"  ~ /etc/locale.conf")
-                changes += 1
-            else:
-                print(f"  = /etc/locale.conf (unchanged)")
-
-        tz = cfg.get("timezone", "")
-        if tz:
-            current_tz = read("/etc/timezone").strip() or run("timedatectl show -p Timezone --value")
-            if current_tz != tz:
-                print(f"  ~ timezone: {current_tz} → {tz}")
-                changes += 1
-            else:
-                print(f"  = timezone: {tz}")
-
-        hostname = cfg.get("hostname", "")
-        if hostname:
-            import socket
-            current_host = socket.gethostname()
-            if current_host != hostname:
-                print(f"  ~ hostname: {current_host} → {hostname}")
-                changes += 1
-            else:
-                print(f"  = hostname: {hostname}")
-        return changes
-
-    def _plan_packages(self) -> int:
-        changes = 0
-        pkgs = self.snap.get("packages", {})
-        print("\n── Packages ──")
-
-        # Native explicit
-        desired = set(pkgs.get("native_explicit", []))
-        installed = set(run_lines("pacman -Qqe 2>/dev/null"))
-        to_install = sorted(desired - installed)
-        to_remove = sorted(installed - desired)
-        if to_install:
-            print(f"  + install {len(to_install)} native packages:")
-            for p in to_install[:20]:
-                print(f"    + {p}")
-            if len(to_install) > 20:
-                print(f"    ... and {len(to_install) - 20} more")
-            changes += len(to_install)
-        if to_remove:
-            print(f"  - {len(to_remove)} packages not in snapshot (will NOT be removed automatically)")
-
-        # AUR
-        aur_desired = set(pkgs.get("aur_packages", []))
-        aur_installed = set(run_lines("pacman -Qqm 2>/dev/null"))
-        aur_to_install = sorted(aur_desired - aur_installed)
-        if aur_to_install:
-            print(f"  + install {len(aur_to_install)} AUR packages:")
-            for p in aur_to_install[:20]:
-                print(f"    + {p}")
-            if len(aur_to_install) > 20:
-                print(f"    ... and {len(aur_to_install) - 20} more")
-            changes += len(aur_to_install)
-
-        # Flatpak
-        flatpak_desired = set(pkgs.get("flatpak", []))
-        flatpak_installed = set(run_lines("flatpak list --app --columns=application 2>/dev/null"))
-        flatpak_to_install = sorted(flatpak_desired - flatpak_installed)
-        if flatpak_to_install:
-            print(f"  + install {len(flatpak_to_install)} flatpak apps:")
-            for p in flatpak_to_install:
-                print(f"    + {p}")
-            changes += len(flatpak_to_install)
-
-        if changes == 0:
-            print(f"  = all packages match")
-        return changes
-
-    def _plan_dotfiles(self) -> int:
-        changes = 0
-        dots = self.snap.get("dotfiles", {})
-        home = Path(dots.get("home_directory", str(get_user_home())))
-        print("\n── Dotfiles ──")
-
-        for rel, content in dots.get("key_dotfiles", {}).items():
-            if content == "[REDACTED]":
-                print(f"  - {rel} (redacted — manual restore)")
-                continue
-            full = home / rel
-            if not full.exists():
-                print(f"  + {rel} (new)")
-                changes += 1
-            elif full.read_text().strip() != content.strip():
-                print(f"  ~ {rel} (modified)")
-                changes += 1
-            else:
-                print(f"  = {rel}")
-
-        if changes == 0:
-            print(f"  = all dotfiles match")
-        return changes
-
-    def _plan_config(self) -> int:
-        changes = 0
-        cfg = self.snap.get("config", {})
-        print("\n── System Config ──")
-
-        for section, basedir in [
-            ("modprobe_d", "/etc/modprobe.d"),
-            ("udev_rules", "/etc/udev/rules.d"),
-            ("tmpfiles_d", "/etc/tmpfiles.d"),
-            ("sysctl_d",   "/etc/sysctl.d"),
-        ]:
-            for name, content in cfg.get(section, {}).items():
-                if section == "sysctl_d" and name == "99-active":
-                    continue
-                path = f"{basedir}/{name}"
-                current = read(path)
-                if not current:
-                    print(f"  + {path} (new)")
-                    changes += 1
-                elif current.strip() != content.strip():
-                    print(f"  ~ {path} (modified)")
-                    changes += 1
-                else:
-                    print(f"  = {path}")
-
-        env_desired = cfg.get("environment", "")
-        if env_desired:
-            current_env = read("/etc/environment")
-            if current_env.strip() != env_desired.strip():
-                print(f"  ~ /etc/environment")
-                changes += 1
-            else:
-                print(f"  = /etc/environment")
-
-        if changes == 0:
-            print(f"  = all config files match")
-        return changes
-
-    def _plan_services(self) -> int:
-        changes = 0
-        svcs = self.snap.get("services", {})
-        print("\n── Systemd Services ──")
-
-        # Custom unit files
-        for name, content in svcs.get("custom_system_units", {}).items():
-            path = f"/etc/systemd/system/{name}"
-            current = read(path)
-            if not current:
-                print(f"  + {path} (new)")
-                changes += 1
-            elif current.strip() != content.strip():
-                print(f"  ~ {path} (modified)")
-                changes += 1
-            else:
-                print(f"  = {path}")
-
-        if changes == 0:
-            print(f"  = all services match")
-        return changes
-
-    def _plan_bootloader(self) -> int:
-        changes = 0
-        boot = self.snap.get("boot", {})
-        bootloader = boot.get("bootloader", "unknown")
-        print(f"\n── Bootloader ({bootloader}) ──")
-
-        if bootloader == "grub":
-            grub_conf = boot.get("bootloader_config", {}).get("default_grub", "")
-            if grub_conf:
-                current = read("/etc/default/grub")
-                if current.strip() != grub_conf.strip():
-                    print(f"  ~ /etc/default/grub (modified → will regenerate grub.cfg)")
-                    changes += 1
-                else:
-                    print(f"  = /etc/default/grub")
-
-            mkinit = boot.get("mkinitcpio", {}).get("conf", "")
-            if mkinit:
-                current = read("/etc/mkinitcpio.conf")
-                if current.strip() != mkinit.strip():
-                    print(f"  ~ /etc/mkinitcpio.conf (modified → will rebuild initramfs)")
-                    changes += 1
-                else:
-                    print(f"  = /etc/mkinitcpio.conf")
-        elif bootloader == "limine":
-            limine_conf = boot.get("bootloader_config", {}).get("limine_conf", "")
-            if limine_conf:
-                for p in ["/boot/limine.conf", "/boot/limine/limine.conf"]:
-                    current = read(p)
-                    if current:
-                        if current.strip() != limine_conf.strip():
-                            print(f"  ~ {p}")
-                            changes += 1
-                        else:
-                            print(f"  = {p}")
-                        break
-        else:
-            print(f"  ? unknown bootloader: {bootloader}")
-
-        if changes == 0:
-            print(f"  = bootloader config matches")
-        return changes
-
-    def _plan_swap(self) -> int:
-        power = self.snap.get("power", {})
-        hibernate = power.get("hibernate", {})
-        swap_file = hibernate.get("swap_file", "")
-        print("\n── Swap & Hibernate ──")
-        if not swap_file:
-            print(f"  = no swapfile in snapshot")
-            return 0
-        if Path(swap_file).exists():
-            print(f"  = {swap_file} exists")
-        else:
-            print(f"  + {swap_file} (manual setup required)")
-        print(f"  ⚠ swap/hibernate always requires manual verification")
-        return 0
-
     def apply(self, steps: list = None):
         available_steps = {
             "locale":     self.step_locale,
@@ -1614,17 +993,6 @@ def diff_snapshots(old: dict, new: dict):
     print(f"  Old: {old.get('meta', {}).get('generated_at', 'unknown')}")
     print(f"  New: {new.get('meta', {}).get('generated_at', 'unknown')}")
     print(f"{'═' * 60}")
-
-    # Meta
-    print("\n── Meta ──")
-    old_host = old.get("meta", {}).get("hostname", "")
-    new_host = new.get("meta", {}).get("hostname", "")
-    if old_host != new_host:
-        print(f"  hostname: {old_host} → {new_host}")
-    old_distro = old.get("meta", {}).get("distro", "")
-    new_distro = new.get("meta", {}).get("distro", "")
-    if old_distro != new_distro:
-        print(f"  distro: {old_distro} → {new_distro}")
 
     # Packages
     print("\n── Packages ──")
@@ -1737,13 +1105,7 @@ def cmd_snapshot(args):
     for name in selected:
         print(f"  [{name}]...", end=" ", flush=True)
         try:
-            if name == "notes":
-                snapshot[name] = collect_notes(
-                    note_modules=getattr(args, 'note_modules', None),
-                    disable_note_modules=getattr(args, 'disable_note_modules', None),
-                )
-            else:
-                snapshot[name] = ALL_COLLECTORS[name]()
+            snapshot[name] = ALL_COLLECTORS[name]()
             print("ok")
         except Exception as e:
             snapshot[name] = {"error": str(e)}
@@ -1759,6 +1121,10 @@ def cmd_snapshot(args):
 
 
 def cmd_apply(args):
+    if os.geteuid() != 0:
+        print("✗ apply mode requires root.", file=sys.stderr)
+        sys.exit(1)
+
     snap_path = args.snapshot
     if not Path(snap_path).exists():
         print(f"✗ Snapshot file not found: {snap_path}", file=sys.stderr)
@@ -1772,14 +1138,7 @@ def cmd_apply(args):
         confirm=args.confirm,
         distro=args.distro,
     )
-    if not args.confirm:
-        # Plan mode — no root needed, just compare
-        applier.plan(steps=args.steps)
-    else:
-        if os.geteuid() != 0:
-            print("✗ apply --confirm requires root.", file=sys.stderr)
-            sys.exit(1)
-        applier.apply(steps=args.steps)
+    applier.apply(steps=args.steps)
 
 
 def cmd_diff(args):
@@ -2105,8 +1464,7 @@ Screen {
     layout: grid;
     grid-size: 2;
     grid-gutter: 1;
-    min-height: 20;
-    height: auto;
+    height: 1fr;
 }
 
 .diff-panel {
@@ -2114,7 +1472,6 @@ Screen {
     background: $surface;
     overflow-y: auto;
     padding: 0 1;
-    min-height: 18;
 }
 
 .diff-added   { color: $success; }
@@ -2127,13 +1484,6 @@ Screen {
     grid-size: 4;
     grid-gutter: 1;
     height: auto;
-    margin-bottom: 1;
-}
-
-.snap-list {
-    max-height: 6;
-    height: auto;
-    border: solid $primary-darken-2;
     margin-bottom: 1;
 }
 
@@ -2256,45 +1606,50 @@ def launch_tui():
 
     class ApplyPanel(Container):
         STEPS = ["locale", "packages", "dotfiles", "config", "services", "bootloader", "swap"]
-        _filtered: list = []
+        _snaps: list = []
 
         def compose(self) -> ComposeResult:
             yield Label("snapshot file")
-            yield Input(placeholder="type to search snapshots...", id="apply-path")
-            yield ListView(id="apply-snap-list", classes="snap-list")
+            yield Input(placeholder="type or select below...", id="apply-path")
+            yield ListView(id="apply-snap-list")
             yield Label("steps")
             with Container(classes="section-grid"):
                 for step in self.STEPS:
-                    yield Checkbox(step, value=True, id=f"step-{step}")
+                    yield Checkbox(step, value=True, id=f"step-{{step}}")
             with Horizontal():
-                yield Button("plan ↵", id="btn-dry", variant="default")
+                yield Button("dry run ↵", id="btn-dry", variant="default")
                 yield Button("apply (confirm) ↵", id="btn-apply", variant="warning")
             yield Log(id="apply-log", auto_scroll=True)
 
         def on_mount(self):
-            self._rebuild_list("")
+            self._refresh_list("")
 
-        def _rebuild_list(self, q: str):
-            snaps = _list_snapshots()
+        def _refresh_list(self, q: str):
+            self._snaps = _list_snapshots()
             lv = self.query_one("#apply-snap-list", ListView)
             lv.clear()
-            self._filtered = []
-            for path in snaps:
+            for path in self._snaps:
                 if not q or q.lower() in path.lower():
                     lv.append(ListItem(Label(Path(path).name)))
-                    self._filtered.append(path)
-            if not self._filtered:
-                lv.append(ListItem(Label("[dim]no snapshots found[/]")))
+            if not self._snaps:
+                lv.append(ListItem(Label("[dim]no snapshots in ~/.config/archero/snapshots/[/]")))
 
         def on_input_changed(self, event: Input.Changed):
             if event.input.id == "apply-path":
-                self._rebuild_list(event.value)
+                self._refresh_list(event.value)
 
         def on_list_view_selected(self, event: ListView.Selected):
             if event.list_view.id == "apply-snap-list":
-                idx = event.list_view.index
-                if idx is not None and idx < len(self._filtered):
-                    self.query_one("#apply-path", Input).value = self._filtered[idx]
+                try:
+                    name = str(event.item.query_one(Label).renderable)
+                    if name.startswith("[dim]"):
+                        return
+                    for path in self._snaps:
+                        if Path(path).name == name:
+                            self.query_one("#apply-path", Input).value = path
+                            break
+                except Exception:
+                    pass
 
         def on_button_pressed(self, event: Button.Pressed):
             if event.button.id in ("btn-dry", "btn-apply"):
@@ -2304,7 +1659,7 @@ def launch_tui():
         def run_apply(self, confirm: bool):
             log = self.query_one("#apply-log", Log)
             snap_path = self.query_one("#apply-path", Input).value.strip()
-            selected_steps = [s for s in self.STEPS if self.query_one(f"#step-{s}", Checkbox).value]
+            selected_steps = [s for s in self.STEPS if self.query_one(f"#step-{{s}}", Checkbox).value]
             log.clear()
             if not snap_path or not Path(snap_path).exists():
                 log.write_line("✗ snapshot file not found")
@@ -2314,9 +1669,9 @@ def launch_tui():
                 snapshot = json.load(f)
             mode = "APPLYING" if confirm else "DRY RUN"
             log.write_line("═" * 50)
-            log.write_line(f"  {mode} — steps: {', '.join(selected_steps)}")
+            log.write_line(f"  {{mode}} — steps: {{', '.join(selected_steps)}}")
             log.write_line("═" * 50)
-            self.app.call_from_thread(self.app.notify, f"{mode} — {', '.join(selected_steps)}", title="apply", severity="warning" if confirm else "information")
+            self.app.call_from_thread(self.app.notify, f"{{mode}} — {{', '.join(selected_steps)}}", title="apply", severity="warning" if confirm else "information")
             import io
             from contextlib import redirect_stdout
             class LogWriter(io.StringIO):
@@ -2329,72 +1684,57 @@ def launch_tui():
                     return len(s)
             applier = Applier(snapshot=snapshot, confirm=confirm, distro="auto")
             with redirect_stdout(LogWriter(log)):
-                if not confirm:
-                    n = applier.plan(steps=selected_steps)
-                    self.app.call_from_thread(self.app.notify, f"Plan: {n} change(s)" if n else "No changes needed", title="plan done", severity="information")
-                else:
-                    applier.apply(steps=selected_steps)
-                    ok  = sum(1 for s, _ in applier.actions if s == "OK")
-                    dry = sum(1 for s, _ in applier.actions if s == "DRY")
-                    err = sum(1 for s, _ in applier.actions if s == "ERROR")
-                    self.app.call_from_thread(self.app.notify, f"{ok} applied · {dry} dry-run · {err} errors", title="apply done", severity="error" if err else "information")
+                applier.apply(steps=selected_steps)
+            ok  = sum(1 for s, _ in applier.actions if s == "OK")
+            dry = sum(1 for s, _ in applier.actions if s == "DRY")
+            err = sum(1 for s, _ in applier.actions if s == "ERROR")
+            self.app.call_from_thread(self.app.notify, f"{{ok}} applied · {{dry}} dry-run · {{err}} errors", title="apply done", severity="error" if err else "information")
 
     # ── Diff Panel ────────────────────────────────────────────────────────────────────────────────
 
     class DiffPanel(Container):
         _snaps: list = []
-        _filtered_a: list = []  # filtered paths shown in list A
-        _filtered_b: list = []  # filtered paths shown in list B
 
         def compose(self) -> ComposeResult:
             yield Label("file A  (older / saved snapshot)")
-            yield Input(placeholder="type to search snapshots...", id="diff-a")
-            yield ListView(id="diff-list-a", classes="snap-list")
+            yield Input(placeholder="type or select below...", id="diff-a")
+            yield ListView(id="diff-snap-list")
             yield Label("file B  (newer — leave blank to compare vs live system)")
-            yield Input(placeholder="type to search or leave empty for live system", id="diff-b")
-            yield ListView(id="diff-list-b", classes="snap-list")
+            yield Input(placeholder="leave empty = compare against live system", id="diff-b")
             yield Button("compare ↵", id="btn-diff", variant="success")
             with Horizontal(id="diff-container"):
                 yield Log(id="diff-left",  auto_scroll=False, classes="diff-panel")
                 yield Log(id="diff-right", auto_scroll=False, classes="diff-panel")
 
         def on_mount(self):
-            self._snaps = _list_snapshots()
-            self._rebuild_list("a", "")
-            self._rebuild_list("b", "")
+            self._refresh_list("")
 
-        def _rebuild_list(self, which: str, q: str):
+        def _refresh_list(self, q: str):
             self._snaps = _list_snapshots()
-            lv = self.query_one(f"#diff-list-{which}", ListView)
+            lv = self.query_one("#diff-snap-list", ListView)
             lv.clear()
-            filtered = []
-            if which == "b":
-                lv.append(ListItem(Label("(live system)")))
-                filtered.append("")  # blank = live system
             for path in self._snaps:
                 if not q or q.lower() in path.lower():
                     lv.append(ListItem(Label(Path(path).name)))
-                    filtered.append(path)
-            if which == "a":
-                self._filtered_a = filtered
-            else:
-                self._filtered_b = filtered
+            if not self._snaps:
+                lv.append(ListItem(Label("[dim]no snapshots found[/]")))
 
         def on_input_changed(self, event: Input.Changed):
             if event.input.id == "diff-a":
-                self._rebuild_list("a", event.value)
-            elif event.input.id == "diff-b":
-                self._rebuild_list("b", event.value)
+                self._refresh_list(event.value)
 
         def on_list_view_selected(self, event: ListView.Selected):
-            lv_id = event.list_view.id
-            idx = event.list_view.index
-            if lv_id == "diff-list-a" and idx is not None:
-                if idx < len(self._filtered_a):
-                    self.query_one("#diff-a", Input).value = self._filtered_a[idx]
-            elif lv_id == "diff-list-b" and idx is not None:
-                if idx < len(self._filtered_b):
-                    self.query_one("#diff-b", Input).value = self._filtered_b[idx]
+            if event.list_view.id == "diff-snap-list":
+                try:
+                    name = str(event.item.query_one(Label).renderable)
+                    if name.startswith("[dim]"):
+                        return
+                    for path in self._snaps:
+                        if Path(path).name == name:
+                            self.query_one("#diff-a", Input).value = path
+                            break
+                except Exception:
+                    pass
 
         def on_button_pressed(self, event: Button.Pressed):
             if event.button.id == "btn-diff":
@@ -2418,101 +1758,36 @@ def launch_tui():
             if path_b and Path(path_b).exists():
                 with open(path_b) as f:
                     new = json.load(f)
-                right.write_line(f"file: {path_b}")
+                right.write_line(f"file: {{path_b}}")
             else:
                 right.write_line("capturing live system...")
-                new = {name: fn() for name, fn in ALL_COLLECTORS.items()}
+                new = {{name: fn() for name, fn in ALL_COLLECTORS.items()}}
                 right.write_line("live system captured")
-            left.write_line(f"file: {path_a}")
-            left.write_line(f"date: {old.get('meta', {}).get('generated_at', 'unknown')}")
-            right.write_line(f"date: {new.get('meta', {}).get('generated_at', 'unknown')}")
-
-            found_diff = False
-
-            def cmp_lists(label, a, b):
-                nonlocal found_diff
+            left.write_line(f"file: {{path_a}}")
+            left.write_line(f"date: {{old.get('meta', {{}}).get('generated_at', 'unknown')}}")
+            right.write_line(f"date: {{new.get('meta', {{}}).get('generated_at', 'unknown')}}")
+            def cmp(label, a, b):
                 added = sorted(set(b) - set(a))
                 removed = sorted(set(a) - set(b))
                 if added or removed:
-                    found_diff = True
-                    left.write_line(f"\n── {label} ──")
-                    right.write_line(f"\n── {label} ──")
+                    left.write_line(f"\n── {{label}} ──")
+                    right.write_line(f"\n── {{label}} ──")
                     for p in removed:
-                        left.write_line(f"  - {p}")
+                        left.write_line(f"  - {{p}}")
                         right.write_line("")
                     for p in added:
                         left.write_line("")
-                        right.write_line(f"  + {p}")
-
-            def cmp_dicts(label, old_d, new_d):
-                nonlocal found_diff
-                all_keys = set(old_d) | set(new_d)
-                changes = []
-                for k in sorted(all_keys):
-                    ov = old_d.get(k, "<missing>")
-                    nv = new_d.get(k, "<missing>")
-                    if ov != nv:
-                        changes.append((k, ov, nv))
-                if changes:
-                    found_diff = True
-                    left.write_line(f"\n── {label} ──")
-                    right.write_line(f"\n── {label} ──")
-                    for k, ov, nv in changes:
-                        left.write_line(f"  {k}: {str(ov)[:80]}")
-                        right.write_line(f"  {k}: {str(nv)[:80]}")
-
-            def cmp_scalar(label, a, b):
-                nonlocal found_diff
-                if a != b:
-                    found_diff = True
-                    left.write_line(f"\n── {label} ──")
-                    right.write_line(f"\n── {label} ──")
-                    left.write_line(f"  {a}")
-                    right.write_line(f"  {b}")
-
-            # Meta
-            cmp_scalar("hostname", old.get("meta", {}).get("hostname", ""), new.get("meta", {}).get("hostname", ""))
-            cmp_scalar("distro", old.get("meta", {}).get("distro", ""), new.get("meta", {}).get("distro", ""))
-
-            # Hardware
-            cmp_scalar("cpu", old.get("hardware", {}).get("cpu_model", ""), new.get("hardware", {}).get("cpu_model", ""))
-            cmp_scalar("ram", old.get("hardware", {}).get("ram_total", ""), new.get("hardware", {}).get("ram_total", ""))
-
-            # Boot
-            cmp_scalar("bootloader", old.get("boot", {}).get("bootloader", ""), new.get("boot", {}).get("bootloader", ""))
-
-            # Packages
-            cmp_lists("native packages", old.get("packages", {}).get("native_explicit", []), new.get("packages", {}).get("native_explicit", []))
-            cmp_lists("AUR packages", old.get("packages", {}).get("aur_packages", []), new.get("packages", {}).get("aur_packages", []))
-            cmp_lists("flatpak", old.get("packages", {}).get("flatpak", []), new.get("packages", {}).get("flatpak", []))
-
-            # Kernel
-            cmp_scalar("kernel", old.get("kernel", {}).get("version", ""), new.get("kernel", {}).get("version", ""))
-            cmp_lists("loaded modules", old.get("kernel", {}).get("loaded_modules", []), new.get("kernel", {}).get("loaded_modules", []))
-
-            # Services
-            cmp_lists("enabled services", old.get("services", {}).get("enabled_system_units", []), new.get("services", {}).get("enabled_system_units", []))
-            cmp_lists("custom units", list(old.get("services", {}).get("custom_system_units", {}).keys()), list(new.get("services", {}).get("custom_system_units", {}).keys()))
-
-            # Config
-            cmp_dicts("modprobe.d", old.get("config", {}).get("modprobe_d", {}), new.get("config", {}).get("modprobe_d", {}))
-            cmp_dicts("udev rules", old.get("config", {}).get("udev_rules", {}), new.get("config", {}).get("udev_rules", {}))
-
-            # Power
-            cmp_scalar("power profile", old.get("power", {}).get("power_profile", ""), new.get("power", {}).get("power_profile", ""))
-
-            # Development
-            cmp_dicts("tool versions", old.get("development", {}).get("tools", {}), new.get("development", {}).get("tools", {}))
-            cmp_lists("ollama models", old.get("development", {}).get("ollama_models", []), new.get("development", {}).get("ollama_models", []))
-
-            # Dotfiles
-            cmp_lists(".config directories", old.get("dotfiles", {}).get("config_directories", []), new.get("dotfiles", {}).get("config_directories", []))
-
-            if not found_diff:
-                left.write_line("\n✓ no differences found")
-                right.write_line("\n✓ no differences found")
-
-            self.app.call_from_thread(self.app.notify, "Diff complete" if found_diff else "No differences found", title="diff done", severity="information")
+                        right.write_line(f"  + {{p}}")
+            cmp("native packages", old.get("packages", {{}}).get("native_explicit", []), new.get("packages", {{}}).get("native_explicit", []))
+            cmp("AUR packages", old.get("packages", {{}}).get("aur_packages", []), new.get("packages", {{}}).get("aur_packages", []))
+            cmp("enabled services", old.get("services", {{}}).get("enabled_system_units", []), new.get("services", {{}}).get("enabled_system_units", []))
+            cmp("ollama models", old.get("development", {{}}).get("ollama_models", []), new.get("development", {{}}).get("ollama_models", []))
+            old_k = old.get("kernel", {{}}).get("version", "")
+            new_k = new.get("kernel", {{}}).get("version", "")
+            if old_k != new_k:
+                left.write_line(f"\n── kernel ──\n  {{old_k}}")
+                right.write_line(f"\n── kernel ──\n  {{new_k}}")
+            self.app.call_from_thread(self.app.notify, "Diff complete", title="diff done", severity="information")
 
     # ── Stats Panel ───────────────────────────────────────────────────────────
 
@@ -2558,8 +1833,7 @@ def launch_tui():
             gov        = read("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
 
             # amdgpu pm info
-            dri = _find_dri_card()
-            pm_raw = run(f"cat /sys/kernel/debug/dri/{dri}/amdgpu_pm_info 2>/dev/null")
+            pm_raw = run("cat /sys/kernel/debug/dri/1/amdgpu_pm_info 2>/dev/null")
             gpu_temp = "–"
             sclk = "–"
             soc_w = "–"
@@ -2690,7 +1964,7 @@ def launch_tui():
 
     # ── Main App ──────────────────────────────────────────────────────────────
 
-    class ArcheroApp(App):
+    class CachyOSApp(App):
         CSS = TUI_CSS
         TITLE = APP_NAME
 
@@ -2801,6 +2075,7 @@ def launch_tui():
 
         def on_key(self, event) -> None:
             key = event.key
+
             # ctrl+q always quits
             if key == "ctrl+q":
                 self.action_quit()
@@ -2851,52 +2126,11 @@ def launch_tui():
                     event.stop()
                     self._enter_panel()
 
-            # Panel mode
+            # Panel mode — arrow keys cycle through focusable widgets
             else:
                 if key != "escape":
                     self._esc_count = 0
-                focused = self.focused
-
-                # ListView: let it handle up/down/enter natively
-                if isinstance(focused, ListView):
-                    if key in ("up", "down", "enter"):
-                        return  # widget handles it
-                    # Tab / right to move to next widget
-                    if key in ("tab", "right"):
-                        event.stop()
-                        self.action_focus_next()
-                        return
-                    return
-
-                # Input: down-arrow jumps to the associated ListView below
-                if isinstance(focused, Input):
-                    if key == "down":
-                        event.stop()
-                        # Map inputs to their paired ListView
-                        input_list_map = {
-                            "diff-a": "diff-list-a",
-                            "diff-b": "diff-list-b",
-                            "apply-path": "apply-snap-list",
-                        }
-                        list_id = input_list_map.get(focused.id)
-                        try:
-                            if list_id:
-                                self.set_focus(self.query_one(f"#{list_id}", ListView))
-                            else:
-                                panel = self.query_one(f"#panel-{self._active_panel}")
-                                lv = panel.query("ListView")
-                                if lv:
-                                    self.set_focus(lv.first())
-                        except Exception:
-                            self.action_focus_next()
-                        return
-                    if key == "tab":
-                        event.stop()
-                        self.action_focus_next()
-                        return
-                    return  # let Input handle all other keys (typing, left/right, etc.)
-
-                if key in ("down", "right", "tab"):
+                if key in ("down", "right"):
                     event.stop()
                     self.action_focus_next()
                 elif key in ("up", "left"):
@@ -2923,7 +2157,7 @@ def launch_tui():
             self._sidebar_idx = 5; self._switch_to_panel("history")
             self._highlight_sidebar(5); self._in_sidebar = True
 
-    ArcheroApp().run()
+    CachyOSApp().run()
 
 
 def _show_loading(delay: float = 2.0):
@@ -2963,7 +2197,7 @@ def _show_loading(delay: float = 2.0):
         row("  \u255a\u2550\u255d  \u255a\u2550\u255d\u255a\u2550\u255d  \u255a\u2550\u255d \u255a\u2550\u2550\u2550\u2550\u2550\u255d\u255a\u2550\u255d  \u255a\u2550\u255d\u255a\u2550\u2550\u2550\u2550\u2550\u2550\u255d\u255a\u2550\u255d  \u255a\u2550\u255d \u255a\u2550\u2550\u2550\u2550\u2550\u255d ", C3),
         row(),
         row("  CachyOS & Arch Linux  --  snapshot · apply · diff · tui  ", YL),
-        row("  github.com/kinncj/archero · GPLv3                        ", DM),
+        row("  Kinn Coelho Juliao · kinncj@protonmail.com · GPLv3        ", DM),
         row(),
         f"{C1}{B}  \u255a{'\u2550' * W}\u255d{R}",
     ]
@@ -3014,16 +2248,10 @@ def main():
 
     # snapshot
     p_snap = sub.add_parser("snapshot", help="Capture current system state to JSON")
-    p_snap.add_argument("--output", "-o", help="Output file (default: archero-snapshot-TIMESTAMP.json)")
+    p_snap.add_argument("--output", "-o", help="Output file (default: cachyos-snapshot-TIMESTAMP.json)")
     p_snap.add_argument("--pretty", "-p", action="store_true", help="Pretty-print JSON")
     p_snap.add_argument("--sections", "-s", nargs="+", choices=list(ALL_COLLECTORS.keys()),
                         help="Only collect specific sections")
-    p_snap.add_argument("--note-modules", nargs="+",
-                        choices=list(NOTE_MODULES.keys()),
-                        help="Only run these note modules (overrides config)")
-    p_snap.add_argument("--disable-note-modules", nargs="+",
-                        choices=list(NOTE_MODULES.keys()),
-                        help="Skip these note modules")
 
     # apply
     p_apply = sub.add_parser("apply", help="Restore system from a snapshot JSON")
