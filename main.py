@@ -1615,7 +1615,7 @@ def launch_tui():
             yield Label("steps")
             with Container(classes="section-grid"):
                 for step in self.STEPS:
-                    yield Checkbox(step, value=True, id=f"step-{{step}}")
+                    yield Checkbox(step, value=True, id=f"step-{step}")
             with Horizontal():
                 yield Button("dry run ↵", id="btn-dry", variant="default")
                 yield Button("apply (confirm) ↵", id="btn-apply", variant="warning")
@@ -1659,7 +1659,7 @@ def launch_tui():
         def run_apply(self, confirm: bool):
             log = self.query_one("#apply-log", Log)
             snap_path = self.query_one("#apply-path", Input).value.strip()
-            selected_steps = [s for s in self.STEPS if self.query_one(f"#step-{{s}}", Checkbox).value]
+            selected_steps = [s for s in self.STEPS if self.query_one(f"#step-{s}", Checkbox).value]
             log.clear()
             if not snap_path or not Path(snap_path).exists():
                 log.write_line("✗ snapshot file not found")
